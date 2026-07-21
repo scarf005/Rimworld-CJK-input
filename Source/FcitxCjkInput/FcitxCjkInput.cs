@@ -14,6 +14,7 @@ namespace FcitxCjkInput {
     public static class FcitxCjkInputMod {
         private const string BridgePath = "/tmp/fcitx5-ime-bridge";
         private const string LogPath = "/tmp/fcitxcjkinput.log";
+        private const double DuplicateCommitSeconds = 0.15;
 
         private static readonly object LogLock = new object();
         private static readonly ConcurrentQueue<string> Responses = new ConcurrentQueue<string>();
@@ -30,6 +31,9 @@ namespace FcitxCjkInput {
         private static bool _overlay = true;
         private static int _overlayFrame = -1;
         private static long _nextBridgeRestart;
+        private static string _lastQueuedCommit = "";
+        private static int _lastQueuedControl;
+        private static long _lastQueuedTimestamp;
         private static GUIStyle _preeditStyle;
 
         private struct PendingCommit {
@@ -152,9 +156,22 @@ namespace FcitxCjkInput {
                     var text = DecodeHex(line.Substring(11));
                     var controlId = GUIUtility.keyboardControl;
                     if (_engine == "hangul" && ContainsNonAscii(text)) {
-                        Commits.Enqueue(new PendingCommit(controlId, text));
-                        WriteLog("QUEUE commit control=" + controlId + " text=[" + Escape(text) +
-                            "] count=" + Commits.Count);
+                        var timestamp = Stopwatch.GetTimestamp();
+                        var duplicateTicks = DuplicateCommitSeconds * Stopwatch.Frequency;
+                        var isDuplicate = text == _lastQueuedCommit && controlId == _lastQueuedControl &&
+                            timestamp - _lastQueuedTimestamp <= duplicateTicks;
+                        if (isDuplicate) {
+                            WriteLog("DROP duplicate commit control=" + controlId + " text=[" +
+                                Escape(text) + "] ageMs=" +
+                                ((timestamp - _lastQueuedTimestamp) * 1000d / Stopwatch.Frequency).ToString("F1"));
+                        } else {
+                            Commits.Enqueue(new PendingCommit(controlId, text));
+                            _lastQueuedCommit = text;
+                            _lastQueuedControl = controlId;
+                            _lastQueuedTimestamp = timestamp;
+                            WriteLog("QUEUE commit control=" + controlId + " text=[" + Escape(text) +
+                                "] count=" + Commits.Count);
+                        }
                     } else {
                         WriteLog("DROP commit engine=" + _engine + " control=" + controlId +
                             " text=[" + Escape(text) + "] reason=ascii-or-non-hangul");
@@ -224,10 +241,10 @@ namespace FcitxCjkInput {
 
             content.text = editor.text;
             GUI.changed = true;
-            ClearPreedit("commit-inserted");
-            WriteLog("INSERT control=" + id + " text=[" + Escape(inserted.ToString()) +
-                "] result=[" + Escape(editor.text) + "] cursor=" + editor.cursorIndex +
-                " select=" + editor.selectIndex);
+            WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
+                Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
+                editor.cursorIndex + " select=" + editor.selectIndex + " preedit=[" +
+                Escape(_preedit) + "]");
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
