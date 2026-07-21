@@ -1,20 +1,25 @@
 /*
- * Observe the fcitx5 context created by Unity's embedded SDL2 backend.
+ * Native fcitx5 signal bridge loaded in-process by FcitxCjkInput.dll.
  *
- * Unity 2022 receives fcitx5 preedit/commit signals but does not connect them
- * to IMGUI text fields. This helper eavesdrops only signals addressed to its
- * parent RimWorld process and forwards them as a line protocol:
+ * Public API:
+ *   int fcitx_bridge_start(uint32_t rimworld_pid)
+ *   int fcitx_bridge_poll(char *buffer, int capacity)
+ *   int fcitx_bridge_is_running(void)
+ *   void fcitx_bridge_stop(void)
  *
+ * Poll messages:
  *   READY:<rimworld-pid>
  *   ENGINE:<unique-name>
  *   PREEDIT_HEX:<UTF-8 byte cursor>:<UTF-8 bytes as hex>
  *   COMMIT_HEX:<UTF-8 bytes as hex>
  *   FOCUS:OUT
+ *   LOG:<diagnostic>
+ *   ERROR:<diagnostic>
  */
 
 #include <dbus/dbus.h>
 #include <errno.h>
-#include <locale.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -23,54 +28,73 @@
 #include <string.h>
 #include <unistd.h>
 
+#define EXPORT __attribute__((visibility("default")))
 #define INPUT_CONTEXT_INTERFACE "org.fcitx.Fcitx.InputContext1"
 #define MAX_TEXT 4096
+#define MAX_MESSAGE 16384
+#define MAX_DESTINATIONS 16
+
+struct message_node {
+    char *text;
+    struct message_node *next;
+};
+
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct message_node *queue_head;
+static struct message_node *queue_tail;
+static pthread_t worker_thread;
+static int worker_created;
+static int dbus_threads_ready;
+static volatile int running;
+static uint32_t rimworld_pid;
 
 static DBusConnection *connection;
-static pid_t rimworld_pid;
-static char rimworld_destinations[16][128];
+static char rimworld_destinations[MAX_DESTINATIONS][128];
 static size_t rimworld_destination_count;
 
-static void log_message(const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    fputs("BRIDGE ", stderr);
-    vfprintf(stderr, format, args);
-    fputc('\n', stderr);
-    fflush(stderr);
-    va_end(args);
-}
-
-static void output_message(const char *format, ...) {
-    char buffer[16384];
+static void enqueue_message(const char *format, ...) {
+    char buffer[MAX_MESSAGE];
     va_list args;
     va_start(args, format);
     const int length = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
-    if (length <= 0 || (size_t)length >= sizeof(buffer)) {
-        log_message("output overflow length=%d", length);
+    if (length <= 0 || (size_t)length >= sizeof(buffer)) return;
+
+    struct message_node *node = malloc(sizeof(*node));
+    if (!node) return;
+    node->text = strdup(buffer);
+    if (!node->text) {
+        free(node);
         return;
     }
-    write(STDOUT_FILENO, buffer, (size_t)length);
-    write(STDOUT_FILENO, "\n", 1);
+    node->next = NULL;
+
+    pthread_mutex_lock(&queue_mutex);
+    if (queue_tail) queue_tail->next = node;
+    else queue_head = node;
+    queue_tail = node;
+    pthread_mutex_unlock(&queue_mutex);
 }
 
-static void output_hex(const char *prefix, const char *text) {
+static void enqueue_hex(const char *prefix, const char *text) {
     static const char digits[] = "0123456789ABCDEF";
-    const size_t length = strlen(text);
-    char *hex = malloc(length * 2 + 1);
-    if (!hex) {
-        log_message("hex allocation failed bytes=%zu", length);
-        return;
-    }
-    for (size_t i = 0; i < length; i++) {
+    const size_t prefix_length = strlen(prefix);
+    const size_t text_length = strlen(text);
+    const size_t length = prefix_length + 1 + text_length * 2;
+    char *message = malloc(length + 1);
+    if (!message) return;
+
+    memcpy(message, prefix, prefix_length);
+    message[prefix_length] = ':';
+    for (size_t i = 0; i < text_length; i++) {
         const unsigned char byte = (unsigned char)text[i];
-        hex[i * 2] = digits[byte >> 4];
-        hex[i * 2 + 1] = digits[byte & 0x0f];
+        message[prefix_length + 1 + i * 2] = digits[byte >> 4];
+        message[prefix_length + 2 + i * 2] = digits[byte & 0x0f];
     }
-    hex[length * 2] = '\0';
-    output_message("%s:%s", prefix, hex);
-    free(hex);
+    message[length] = '\0';
+    enqueue_message("%s", message);
+    free(message);
 }
 
 static uint32_t connection_pid(const char *name) {
@@ -86,7 +110,7 @@ static uint32_t connection_pid(const char *name) {
         connection, request, 1000, &error);
     dbus_message_unref(request);
     if (!reply) {
-        log_message("pid lookup failed destination=%s error=%s", name,
+        enqueue_message("ERROR:pid lookup destination=%s error=%s", name,
             dbus_error_is_set(&error) ? error.message : "no reply");
         dbus_error_free(&error);
         return 0;
@@ -95,8 +119,8 @@ static uint32_t connection_pid(const char *name) {
     uint32_t pid = 0;
     if (!dbus_message_get_args(reply, &error, DBUS_TYPE_UINT32, &pid,
             DBUS_TYPE_INVALID)) {
-        log_message("pid reply invalid destination=%s error=%s", name,
-            dbus_error_is_set(&error) ? error.message : "unknown");
+        enqueue_message("ERROR:pid reply destination=%s error=%s", name,
+            dbus_error_is_set(&error) ? error.message : "invalid reply");
         dbus_error_free(&error);
     }
     dbus_message_unref(reply);
@@ -114,7 +138,7 @@ static int discover_rimworld_destinations(void) {
         connection, request, 1000, &error);
     dbus_message_unref(request);
     if (!reply) {
-        log_message("ListNames failed error=%s",
+        enqueue_message("ERROR:ListNames error=%s",
             dbus_error_is_set(&error) ? error.message : "no reply");
         dbus_error_free(&error);
         return 0;
@@ -127,16 +151,17 @@ static int discover_rimworld_destinations(void) {
         return 0;
     }
 
+    rimworld_destination_count = 0;
     DBusMessageIter names;
     dbus_message_iter_recurse(&root, &names);
     while (dbus_message_iter_get_arg_type(&names) == DBUS_TYPE_STRING &&
-        rimworld_destination_count < 16) {
+        rimworld_destination_count < MAX_DESTINATIONS) {
         const char *name = "";
         dbus_message_iter_get_basic(&names, &name);
-        if (name[0] == ':' && connection_pid(name) == (uint32_t)rimworld_pid) {
+        if (name[0] == ':' && connection_pid(name) == rimworld_pid) {
             snprintf(rimworld_destinations[rimworld_destination_count],
                 sizeof(rimworld_destinations[0]), "%s", name);
-            log_message("target destination=%s pid=%d", name, (int)rimworld_pid);
+            enqueue_message("LOG:target destination=%s pid=%u", name, rimworld_pid);
             rimworld_destination_count++;
         }
         dbus_message_iter_next(&names);
@@ -173,7 +198,7 @@ static int become_monitor(void) {
         connection, request, 1000, &error);
     dbus_message_unref(request);
     if (!reply) {
-        log_message("BecomeMonitor failed error=%s",
+        enqueue_message("ERROR:BecomeMonitor error=%s",
             dbus_error_is_set(&error) ? error.message : "no reply");
         dbus_error_free(&error);
         return 0;
@@ -186,8 +211,7 @@ static int is_rimworld_signal(DBusMessage *message) {
     const char *destination = dbus_message_get_destination(message);
     if (!destination || destination[0] != ':') return 0;
     for (size_t i = 0; i < rimworld_destination_count; i++) {
-        if (strcmp(destination, rimworld_destinations[i]) == 0)
-            return 1;
+        if (strcmp(destination, rimworld_destinations[i]) == 0) return 1;
     }
     return 0;
 }
@@ -198,9 +222,9 @@ static int read_string(DBusMessage *message, char *buffer, size_t size) {
     const char *text = "";
     if (!dbus_message_get_args(message, &error, DBUS_TYPE_STRING, &text,
             DBUS_TYPE_INVALID)) {
-        log_message("string signal parse failed member=%s error=%s",
+        enqueue_message("ERROR:string parse member=%s error=%s",
             dbus_message_get_member(message),
-            dbus_error_is_set(&error) ? error.message : "unknown");
+            dbus_error_is_set(&error) ? error.message : "invalid signal");
         dbus_error_free(&error);
         return 0;
     }
@@ -226,11 +250,7 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
             const char *part = "";
             dbus_message_iter_get_basic(&entry, &part);
             const size_t part_length = strlen(part);
-            if (part_length >= size - used) {
-                log_message("preedit truncated bytes=%zu capacity=%zu", used + part_length,
-                    size);
-                return 0;
-            }
+            if (part_length >= size - used) return 0;
             memcpy(buffer + used, part, part_length);
             used += part_length;
             buffer[used] = '\0';
@@ -252,7 +272,6 @@ static void handle_signal(DBusMessage *message) {
         return;
 
     const char *member = dbus_message_get_member(message);
-    const char *path = dbus_message_get_path(message);
     if (!member) return;
 
     if (strcmp(member, "CurrentIM") == 0) {
@@ -266,71 +285,73 @@ static void handle_signal(DBusMessage *message) {
                 DBUS_TYPE_STRING, &unique_name,
                 DBUS_TYPE_STRING, &language,
                 DBUS_TYPE_INVALID)) {
-            log_message("signal path=%s member=CurrentIM name=%s unique=%s lang=%s",
-                path, name, unique_name, language);
-            output_message("ENGINE:%s", unique_name);
+            enqueue_message("LOG:CurrentIM name=%s unique=%s lang=%s",
+                name, unique_name, language);
+            enqueue_message("ENGINE:%s", unique_name);
         } else {
-            log_message("CurrentIM parse failed error=%s", error.message);
+            enqueue_message("ERROR:CurrentIM parse error=%s", error.message);
             dbus_error_free(&error);
         }
     } else if (strcmp(member, "CommitString") == 0) {
         char text[MAX_TEXT];
         if (read_string(message, text, sizeof(text))) {
-            log_message("signal path=%s member=CommitString bytes=%zu text=%s", path,
-                strlen(text), text);
-            output_hex("COMMIT_HEX", text);
+            enqueue_message("LOG:CommitString bytes=%zu text=%s", strlen(text), text);
+            enqueue_hex("COMMIT_HEX", text);
         }
     } else if (strcmp(member, "UpdateFormattedPreedit") == 0) {
         char text[MAX_TEXT];
         int32_t cursor = 0;
         if (read_preedit(message, text, sizeof(text), &cursor)) {
-            log_message("signal path=%s member=UpdateFormattedPreedit cursor=%d bytes=%zu text=%s",
-                path, cursor, strlen(text), text);
+            enqueue_message("LOG:Preedit cursor=%d bytes=%zu text=%s",
+                cursor, strlen(text), text);
             char prefix[64];
             snprintf(prefix, sizeof(prefix), "PREEDIT_HEX:%d", cursor);
-            output_hex(prefix, text);
+            enqueue_hex(prefix, text);
         } else {
-            log_message("UpdateFormattedPreedit parse failed path=%s", path);
+            enqueue_message("ERROR:Preedit parse failed");
         }
     } else if (strcmp(member, "NotifyFocusOut") == 0) {
-        log_message("signal path=%s member=NotifyFocusOut", path);
-        output_message("FOCUS:OUT");
+        enqueue_message("LOG:NotifyFocusOut");
+        enqueue_message("FOCUS:OUT");
     }
 }
 
-int main(void) {
-    setlocale(LC_ALL, "C.UTF-8");
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
-    rimworld_pid = getppid();
+static void close_connection(void) {
+    if (!connection) return;
+    dbus_connection_close(connection);
+    dbus_connection_unref(connection);
+    connection = NULL;
+}
+
+static void *monitor_worker(void *unused) {
+    (void)unused;
 
     DBusError error;
     dbus_error_init(&error);
     connection = dbus_bus_get_private(DBUS_BUS_SESSION, &error);
     if (!connection) {
-        log_message("session bus failed error=%s",
+        enqueue_message("ERROR:session bus error=%s",
             dbus_error_is_set(&error) ? error.message : "unknown");
         dbus_error_free(&error);
-        return 1;
+        running = 0;
+        return NULL;
     }
     dbus_connection_set_exit_on_disconnect(connection, FALSE);
 
     if (!discover_rimworld_destinations()) {
-        log_message("no D-Bus destination found for parent=%d", (int)rimworld_pid);
-        dbus_connection_close(connection);
-        dbus_connection_unref(connection);
-        return 2;
+        enqueue_message("ERROR:no D-Bus destination for pid=%u", rimworld_pid);
+        close_connection();
+        running = 0;
+        return NULL;
     }
     if (!become_monitor()) {
-        dbus_connection_close(connection);
-        dbus_connection_unref(connection);
-        return 1;
+        close_connection();
+        running = 0;
+        return NULL;
     }
-    log_message("ready parent=%d destinations=%zu", (int)rimworld_pid,
-        rimworld_destination_count);
-    output_message("READY:%d", (int)rimworld_pid);
 
-    while (getppid() == rimworld_pid && kill(rimworld_pid, 0) == 0) {
+    enqueue_message("READY:%u", rimworld_pid);
+    while (running && kill((pid_t)rimworld_pid, 0) == 0) {
         if (!dbus_connection_read_write(connection, 250)) break;
         DBusMessage *message;
         while ((message = dbus_connection_pop_message(connection)) != NULL) {
@@ -339,8 +360,74 @@ int main(void) {
         }
     }
 
-    log_message("exit parent=%d errno=%d", (int)rimworld_pid, errno);
-    dbus_connection_close(connection);
-    dbus_connection_unref(connection);
-    return 0;
+    close_connection();
+    running = 0;
+    return NULL;
+}
+
+EXPORT int fcitx_bridge_start(uint32_t pid) {
+    pthread_mutex_lock(&state_mutex);
+    if (!dbus_threads_ready) {
+        if (!dbus_threads_init_default()) {
+            pthread_mutex_unlock(&state_mutex);
+            return ENOMEM;
+        }
+        dbus_threads_ready = 1;
+    }
+    if (running) {
+        pthread_mutex_unlock(&state_mutex);
+        return 0;
+    }
+    if (worker_created) {
+        pthread_join(worker_thread, NULL);
+        worker_created = 0;
+    }
+
+    rimworld_pid = pid;
+    running = 1;
+    const int result = pthread_create(&worker_thread, NULL, monitor_worker, NULL);
+    if (result == 0) worker_created = 1;
+    else {
+        running = 0;
+        enqueue_message("ERROR:pthread_create result=%d", result);
+    }
+    pthread_mutex_unlock(&state_mutex);
+    return result;
+}
+
+EXPORT int fcitx_bridge_poll(char *buffer, int capacity) {
+    if (!buffer || capacity <= 1) return -1;
+
+    pthread_mutex_lock(&queue_mutex);
+    struct message_node *node = queue_head;
+    if (!node) {
+        pthread_mutex_unlock(&queue_mutex);
+        return 0;
+    }
+    queue_head = node->next;
+    if (!queue_head) queue_tail = NULL;
+    pthread_mutex_unlock(&queue_mutex);
+
+    const size_t length = strlen(node->text);
+    const size_t copy_length = length < (size_t)(capacity - 1)
+        ? length : (size_t)(capacity - 1);
+    memcpy(buffer, node->text, copy_length);
+    buffer[copy_length] = '\0';
+    free(node->text);
+    free(node);
+    return (int)copy_length;
+}
+
+EXPORT int fcitx_bridge_is_running(void) {
+    return running;
+}
+
+EXPORT void fcitx_bridge_stop(void) {
+    pthread_mutex_lock(&state_mutex);
+    running = 0;
+    if (worker_created) {
+        pthread_join(worker_thread, NULL);
+        worker_created = 0;
+    }
+    pthread_mutex_unlock(&state_mutex);
 }

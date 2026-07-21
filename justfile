@@ -4,18 +4,20 @@ steam_os := "RimWorldLinux_Data"
 mod_name := "FcitxCjkInput"
 package_id := "scarf.fcitxcjkinput"
 mod_dest := rimworld + "/Mods/" + mod_name
-bridge_src := "helper/fcitx5-ime-bridge.c"
-bridge_bin := "helper/fcitx5-ime-bridge"
+native_src := "native/fcitxcjkinput.c"
+native_bin := "1.6/Assemblies/libfcitxcjkinput.so"
 
 # Download Harmony
 prepare:
     curl -LO https://github.com/pardeike/HarmonyRimWorld/releases/latest/download/HarmonyMod.zip
     7z x -y HarmonyMod.zip -opackages
 
-# Build the C bridge
-build-bridge:
-    gcc -o {{bridge_bin}} {{bridge_src}} $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
-    @echo "Bridge built: {{bridge_bin}}"
+# Build the in-process native bridge
+build-native:
+    mkdir -p "$(dirname {{native_bin}})"
+    gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
+        -o {{native_bin}} {{native_src}} $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
+    @echo "Native bridge built: {{native_bin}}"
 
 # Format C# source
 fmt:
@@ -28,22 +30,15 @@ build-dll:
     mise exec dotnet@8.0.422 -- dotnet build ./Source/{{mod_name}}/{{mod_name}}.csproj -c Release
 
 # Build everything
-build: build-bridge build-dll
+build: build-native build-dll
 
 # Install built mod to RimWorld Mods directory
 install: build
     mkdir -p "{{mod_dest}}/1.6/Assemblies"
     mkdir -p "{{mod_dest}}/About"
-    mkdir -p "{{mod_dest}}/Languages"
-    mkdir -p "{{mod_dest}}/helper"
     cp -r 1.6/Assemblies/* "{{mod_dest}}/1.6/Assemblies/"
     cp About/About.xml "{{mod_dest}}/About/"
-    cp -r Languages/* "{{mod_dest}}/Languages/"
-    cp {{bridge_bin}} "{{mod_dest}}/helper/"
-    rm -f /tmp/fcitx5-ime-bridge 2>/dev/null || true
-    cp {{bridge_bin}} /tmp/fcitx5-ime-bridge
-    chmod +x "{{mod_dest}}/helper/fcitx5-ime-bridge"
-    chmod +x /tmp/fcitx5-ime-bridge
+    rm -rf "{{mod_dest}}/helper" "{{mod_dest}}/Languages"
     @echo "Installed to {{mod_dest}}"
 
 # Install and enable in ModsConfig.xml

@@ -20,16 +20,15 @@
   </modDependencies>
   <description><![CDATA[Fcitx5 CJK input support for RimWorld on Linux.
 
-Uses fcitx5's IBus D-Bus compatibility layer to forward key events
-from IMGUI text fields to fcitx5, and insert committed text back.
+Connects Unity's native SDL2/fcitx5 input context to RimWorld IMGUI text fields.
+Supports physical IME toggle keys, preedit text, commits, and cursor placement.
 
-기능:
-- Linux에서 fcitx5 한글/중국어/일본어 입력 지원
-- IMGUI TextField/TextArea 지원
-- D-Bus IBus 호환 인터페이스 사용
+Steam launch options:
+XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 Requirements:
-- Linux RimWorld 1.6
+- Native Linux RimWorld 1.6
 - Harmony
-- fcitx5 with IBus frontend enabled]]></description>
+- fcitx5
+- libdbus-1.so.3]]></description>
 </ModMetaData>

@@ -1,10 +1,10 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 using HarmonyLib;
 using UnityEngine;
 using Verse;
@@ -12,28 +12,51 @@ using Verse;
 namespace FcitxCjkInput {
     [StaticConstructorOnStartup]
     public static class FcitxCjkInputMod {
-        private const string BridgePath = "/tmp/fcitx5-ime-bridge";
+        private const string NativeLibraryName = "libfcitxcjkinput.so";
         private const string LogPath = "/tmp/fcitxcjkinput.log";
         private const double DuplicateCommitSeconds = 0.15;
+        private const int RtldNow = 2;
+        private const int NativeBufferSize = 16384;
 
         private static readonly object LogLock = new object();
-        private static readonly ConcurrentQueue<string> Responses = new ConcurrentQueue<string>();
         private static readonly Queue<PendingCommit> Commits = new Queue<PendingCommit>();
+        private static readonly byte[] NativeBuffer = new byte[NativeBufferSize];
 
         private static StreamWriter _log;
-        private static Process _bridge;
-        private static Thread _reader;
+        private static IntPtr _nativeHandle;
+        private static NativeStart _nativeStart;
+        private static NativePoll _nativePoll;
+        private static NativeIsRunning _nativeIsRunning;
         private static string _engine = "unknown";
         private static string _preedit = "";
         private static int _preeditCursor;
         private static int _preeditControl;
-        private static bool _bridgeReady;
+        private static bool _nativeReady;
         private static bool _overlay = true;
         private static int _overlayFrame = -1;
-        private static long _nextBridgeRestart;
+        private static long _nextNativeRestart;
+        private static bool _nativeLoaded;
         private static string _lastQueuedCommit = "";
         private static int _lastQueuedControl;
         private static long _lastQueuedTimestamp;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int NativeStart(uint pid);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int NativePoll([Out] byte[] buffer, int capacity);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int NativeIsRunning();
+
+        [DllImport("libdl.so.2")]
+        private static extern IntPtr dlopen(string fileName, int flags);
+
+        [DllImport("libdl.so.2")]
+        private static extern IntPtr dlsym(IntPtr handle, string symbol);
+
+        [DllImport("libdl.so.2")]
+        private static extern IntPtr dlerror();
 
         private struct PendingCommit {
             public readonly int ControlId;
@@ -54,13 +77,17 @@ namespace FcitxCjkInput {
         }
 
         static FcitxCjkInputMod() {
+            if (Application.platform != RuntimePlatform.LinuxPlayer)
+                return;
+
             try {
                 _log = new StreamWriter(LogPath, false, new UTF8Encoding(false)) { AutoFlush = true };
                 WriteLog("INIT unity=" + Application.unityVersion + " pid=" + Process.GetCurrentProcess().Id +
                     " XMODIFIERS=" + Environment.GetEnvironmentVariable("XMODIFIERS") +
                     " SDL_IM_MODULE=" + Environment.GetEnvironmentVariable("SDL_IM_MODULE"));
+                LoadNativeBridge();
                 Patch();
-                StartBridge();
+                StartNativeBridge();
                 Log.Message("[CJK] fcitx5 SDL/IMGUI bridge initialized; log=" + LogPath);
             } catch (Exception exception) {
                 WriteLog("FATAL " + exception);
@@ -85,68 +112,73 @@ namespace FcitxCjkInput {
             WriteLog("PATCH Event.current=" + currentGetter + " textField=" + desktopTextField);
         }
 
-        private static void StartBridge() {
-            _nextBridgeRestart = DateTime.UtcNow.AddSeconds(2).Ticks;
-            if (!File.Exists(BridgePath)) {
-                WriteLog("BRIDGE missing path=" + BridgePath);
-                return;
-            }
-            if (_bridge != null && !_bridge.HasExited)
-                return;
+        private static void LoadNativeBridge() {
+            var content = LoadedModManager.RunningModsListForReading
+                .FirstOrDefault(mod => mod.PackageId == "scarf.fcitxcjkinput");
+            var assemblyDirectory = content != null
+                ? Path.Combine(content.RootDir, "1.6", "Assemblies")
+                : Path.GetDirectoryName(typeof(FcitxCjkInputMod).Assembly.Location);
+            var path = Path.Combine(assemblyDirectory, NativeLibraryName);
+            _nativeHandle = dlopen(path, RtldNow);
+            if (_nativeHandle == IntPtr.Zero)
+                throw new DllNotFoundException(path + ": " + GetDlError());
 
-            _bridgeReady = false;
-            var process = new Process {
-                StartInfo = new ProcessStartInfo {
-                    FileName = BridgePath,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                }
-            };
-            process.ErrorDataReceived += (_, args) => {
-                if (!string.IsNullOrEmpty(args.Data))
-                    WriteLog(args.Data);
-            };
-            process.Start();
-            process.BeginErrorReadLine();
-            _bridge = process;
-            _reader = new Thread(() => ReadBridge(process)) {
-                IsBackground = true,
-                Name = "FcitxCjkInput bridge reader"
-            };
-            _reader.Start();
-            WriteLog("BRIDGE start pid=" + process.Id + " path=" + BridgePath);
+            _nativeStart = LoadNativeFunction<NativeStart>("fcitx_bridge_start");
+            _nativePoll = LoadNativeFunction<NativePoll>("fcitx_bridge_poll");
+            _nativeIsRunning = LoadNativeFunction<NativeIsRunning>("fcitx_bridge_is_running");
+            _nativeLoaded = true;
+            WriteLog("NATIVE loaded path=" + path);
         }
 
-        private static void ReadBridge(Process process) {
-            try {
-                using (var reader = new StreamReader(process.StandardOutput.BaseStream, Encoding.UTF8)) {
-                    string line;
-                    while ((line = reader.ReadLine()) != null)
-                        Responses.Enqueue(line);
-                }
-                WriteLog("BRIDGE stdout closed pid=" + process.Id);
-            } catch (Exception exception) {
-                WriteLog("BRIDGE reader failed pid=" + process.Id + " error=" + exception);
-            }
+        private static T LoadNativeFunction<T>(string name) where T : class {
+            var pointer = dlsym(_nativeHandle, name);
+            if (pointer == IntPtr.Zero)
+                throw new MissingMethodException(name + ": " + GetDlError());
+            return (T)(object)Marshal.GetDelegateForFunctionPointer(pointer, typeof(T));
         }
 
-        private static void EnsureBridge() {
-            if (_bridge != null && !_bridge.HasExited)
+        private static string GetDlError() {
+            var pointer = dlerror();
+            return pointer == IntPtr.Zero ? "unknown dlerror" : Marshal.PtrToStringAnsi(pointer);
+        }
+
+        private static void StartNativeBridge() {
+            _nextNativeRestart = DateTime.UtcNow.AddSeconds(2).Ticks;
+            _nativeReady = false;
+            var result = _nativeStart((uint)Process.GetCurrentProcess().Id);
+            WriteLog("NATIVE start result=" + result);
+        }
+
+        private static void EnsureNativeBridge() {
+            if (!_nativeLoaded || _nativeIsRunning() != 0)
                 return;
-            if (DateTime.UtcNow.Ticks < _nextBridgeRestart)
+            if (DateTime.UtcNow.Ticks < _nextNativeRestart)
                 return;
-            WriteLog("BRIDGE restart requested");
-            StartBridge();
+            WriteLog("NATIVE restart requested");
+            StartNativeBridge();
         }
 
         private static void Pump() {
-            EnsureBridge();
-            while (Responses.TryDequeue(out var line)) {
+            EnsureNativeBridge();
+            if (!_nativeLoaded)
+                return;
+
+            while (true) {
+                var length = _nativePoll(NativeBuffer, NativeBuffer.Length);
+                if (length <= 0)
+                    break;
+                var line = Encoding.UTF8.GetString(NativeBuffer, 0, length);
+                if (line.StartsWith("LOG:", StringComparison.Ordinal)) {
+                    WriteLog("NATIVE " + line.Substring(4));
+                    continue;
+                }
+                if (line.StartsWith("ERROR:", StringComparison.Ordinal)) {
+                    WriteLog("NATIVE " + line);
+                    continue;
+                }
                 WriteLog("RX " + line);
                 if (line.StartsWith("READY:", StringComparison.Ordinal)) {
-                    _bridgeReady = true;
+                    _nativeReady = true;
                 } else if (line.StartsWith("ENGINE:", StringComparison.Ordinal)) {
                     var nextEngine = line.Substring(7);
                     if (_engine != nextEngine)
@@ -307,7 +339,7 @@ namespace FcitxCjkInput {
                 fontSize = 13,
                 normal = { textColor = _engine == "hangul" ? Color.green : Color.yellow }
             };
-            var text = "[CJK] engine=" + _engine + " bridge=" + (_bridgeReady ? "ready" : "waiting") +
+            var text = "[CJK] engine=" + _engine + " native=" + (_nativeReady ? "ready" : "waiting") +
                 " focus=" + GUIUtility.keyboardControl + " preedit=[" + Escape(_preedit) +
                 "] cursor=" + _preeditCursor + " commits=" + Commits.Count + "\nF11: diagnostics";
             GUI.Label(new Rect(10f, 10f, 900f, 48f), text, style);
