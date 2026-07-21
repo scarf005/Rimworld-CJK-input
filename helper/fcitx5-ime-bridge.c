@@ -7,7 +7,7 @@
  *
  *   READY:<rimworld-pid>
  *   ENGINE:<unique-name>
- *   PREEDIT_HEX:<UTF-8 bytes as hex>
+ *   PREEDIT_HEX:<UTF-8 byte cursor>:<UTF-8 bytes as hex>
  *   COMMIT_HEX:<UTF-8 bytes as hex>
  *   FOCUS:OUT
  */
@@ -286,7 +286,9 @@ static void handle_signal(DBusMessage *message) {
         if (read_preedit(message, text, sizeof(text), &cursor)) {
             log_message("signal path=%s member=UpdateFormattedPreedit cursor=%d bytes=%zu text=%s",
                 path, cursor, strlen(text), text);
-            output_hex("PREEDIT_HEX", text);
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "PREEDIT_HEX:%d", cursor);
+            output_hex(prefix, text);
         } else {
             log_message("UpdateFormattedPreedit parse failed path=%s", path);
         }

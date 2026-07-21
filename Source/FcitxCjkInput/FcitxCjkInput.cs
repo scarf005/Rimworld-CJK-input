@@ -19,13 +19,13 @@ namespace FcitxCjkInput {
         private static readonly object LogLock = new object();
         private static readonly ConcurrentQueue<string> Responses = new ConcurrentQueue<string>();
         private static readonly Queue<PendingCommit> Commits = new Queue<PendingCommit>();
-        private static readonly GUIContent DrawContent = new GUIContent();
 
         private static StreamWriter _log;
         private static Process _bridge;
         private static Thread _reader;
         private static string _engine = "unknown";
         private static string _preedit = "";
+        private static int _preeditCursor;
         private static int _preeditControl;
         private static bool _bridgeReady;
         private static bool _overlay = true;
@@ -34,7 +34,6 @@ namespace FcitxCjkInput {
         private static string _lastQueuedCommit = "";
         private static int _lastQueuedControl;
         private static long _lastQueuedTimestamp;
-        private static GUIStyle _preeditStyle;
 
         private struct PendingCommit {
             public readonly int ControlId;
@@ -44,6 +43,14 @@ namespace FcitxCjkInput {
                 ControlId = controlId;
                 Text = text;
             }
+        }
+
+        private struct PreeditDrawState {
+            public bool Active;
+            public string ContentText;
+            public string EditorText;
+            public int CursorIndex;
+            public int SelectIndex;
         }
 
         static FcitxCjkInputMod() {
@@ -148,10 +155,19 @@ namespace FcitxCjkInput {
                     if (_engine != "hangul")
                         ClearPreedit("engine=" + _engine);
                 } else if (line.StartsWith("PREEDIT_HEX:", StringComparison.Ordinal)) {
-                    var nextPreedit = DecodeHex(line.Substring(12));
-                    _preedit = nextPreedit;
+                    var payload = line.Substring(12);
+                    var separator = payload.IndexOf(':');
+                    if (separator < 0)
+                        throw new FormatException("Missing preedit cursor separator: " + line);
+                    var cursorBytes = int.Parse(payload.Substring(0, separator));
+                    var hex = payload.Substring(separator + 1);
+                    var bytes = DecodeHexBytes(hex);
+                    var clampedCursorBytes = Math.Max(0, Math.Min(cursorBytes, bytes.Length));
+                    _preedit = Encoding.UTF8.GetString(bytes);
+                    _preeditCursor = Encoding.UTF8.GetString(bytes, 0, clampedCursorBytes).Length;
                     _preeditControl = GUIUtility.keyboardControl;
-                    WriteLog("STATE preedit control=" + _preeditControl + " text=[" + Escape(nextPreedit) + "]");
+                    WriteLog("STATE preedit control=" + _preeditControl + " cursorBytes=" + cursorBytes +
+                        " cursorChars=" + _preeditCursor + " text=[" + Escape(_preedit) + "]");
                 } else if (line.StartsWith("COMMIT_HEX:", StringComparison.Ordinal)) {
                     var text = DecodeHex(line.Substring(11));
                     var controlId = GUIUtility.keyboardControl;
@@ -216,72 +232,74 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
+            bool multiline, int maxLength, GUIStyle style, TextEditor editor,
+            ref PreeditDrawState __state) {
+            __state = default;
             Pump();
-            if (GUIUtility.keyboardControl != id || Commits.Count == 0)
+            if (GUIUtility.keyboardControl != id)
                 return;
 
-            var remaining = Commits.Count;
-            var inserted = new StringBuilder();
-            while (remaining-- > 0) {
-                var commit = Commits.Dequeue();
-                if (commit.ControlId != 0 && commit.ControlId != id) {
-                    Commits.Enqueue(commit);
-                    continue;
+            if (Commits.Count > 0) {
+                var remaining = Commits.Count;
+                var inserted = new StringBuilder();
+                while (remaining-- > 0) {
+                    var commit = Commits.Dequeue();
+                    if (commit.ControlId != 0 && commit.ControlId != id) {
+                        Commits.Enqueue(commit);
+                        continue;
+                    }
+                    foreach (var character in commit.Text) {
+                        if (maxLength >= 0 && editor.text.Length >= maxLength)
+                            break;
+                        editor.Insert(character);
+                        inserted.Append(character);
+                    }
                 }
-                foreach (var character in commit.Text) {
-                    if (maxLength >= 0 && editor.text.Length >= maxLength)
-                        break;
-                    editor.Insert(character);
-                    inserted.Append(character);
+                if (inserted.Length > 0) {
+                    content.text = editor.text;
+                    GUI.changed = true;
+                    WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
+                        Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
+                        editor.cursorIndex + " select=" + editor.selectIndex + " preedit=[" +
+                        Escape(_preedit) + "]");
                 }
             }
-            if (inserted.Length == 0)
+
+            if (Event.current.type != EventType.Repaint || _preeditControl != id ||
+                _preedit.Length == 0)
                 return;
 
-            content.text = editor.text;
-            GUI.changed = true;
-            WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
-                Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
-                editor.cursorIndex + " select=" + editor.selectIndex + " preedit=[" +
-                Escape(_preedit) + "]");
+            __state.Active = true;
+            __state.ContentText = content.text;
+            __state.EditorText = editor.text;
+            __state.CursorIndex = editor.cursorIndex;
+            __state.SelectIndex = editor.selectIndex;
+
+            var selectionStart = Math.Min(editor.cursorIndex, editor.selectIndex);
+            var selectionEnd = Math.Max(editor.cursorIndex, editor.selectIndex);
+            var displayText = editor.text.Remove(selectionStart, selectionEnd - selectionStart)
+                .Insert(selectionStart, _preedit);
+            var displayCursor = selectionStart + Math.Min(_preeditCursor, _preedit.Length);
+            editor.text = displayText;
+            content.text = displayText;
+            editor.cursorIndex = displayCursor;
+            editor.selectIndex = displayCursor;
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
-            if (Event.current.type != EventType.Repaint)
-                return;
+            bool multiline, int maxLength, GUIStyle style, TextEditor editor,
+            PreeditDrawState __state) {
+            if (__state.Active) {
+                content.text = __state.ContentText;
+                editor.text = __state.EditorText;
+                editor.cursorIndex = __state.CursorIndex;
+                editor.selectIndex = __state.SelectIndex;
+            }
 
-            if (GUIUtility.keyboardControl == id && _preeditControl == id && _preedit.Length > 0)
-                DrawPreedit(position, style, editor);
-            if (_overlay && _overlayFrame != Time.frameCount) {
+            if (Event.current.type == EventType.Repaint && _overlay && _overlayFrame != Time.frameCount) {
                 _overlayFrame = Time.frameCount;
                 DrawOverlay();
             }
-        }
-
-        private static void DrawPreedit(Rect position, GUIStyle style, TextEditor editor) {
-            if (_preeditStyle == null) {
-                _preeditStyle = new GUIStyle(style) {
-                    padding = new RectOffset(),
-                    margin = new RectOffset(),
-                    border = new RectOffset()
-                };
-                _preeditStyle.normal.background = null;
-                _preeditStyle.hover.background = null;
-                _preeditStyle.active.background = null;
-                _preeditStyle.focused.background = null;
-            }
-            _preeditStyle.font = style.font;
-            _preeditStyle.fontSize = style.fontSize;
-            _preeditStyle.fontStyle = style.fontStyle;
-            _preeditStyle.normal.textColor = Color.cyan;
-
-            DrawContent.text = editor.text;
-            var caret = style.GetCursorPixelPosition(position, DrawContent, editor.cursorIndex) -
-                editor.scrollOffset;
-            GUI.Label(new Rect(caret.x, caret.y, Math.Max(120f, position.xMax - caret.x),
-                Math.Max(style.lineHeight, 20f)), _preedit, _preeditStyle);
         }
 
         private static void DrawOverlay() {
@@ -291,7 +309,7 @@ namespace FcitxCjkInput {
             };
             var text = "[CJK] engine=" + _engine + " bridge=" + (_bridgeReady ? "ready" : "waiting") +
                 " focus=" + GUIUtility.keyboardControl + " preedit=[" + Escape(_preedit) +
-                "] commits=" + Commits.Count + "\nF11: diagnostics";
+                "] cursor=" + _preeditCursor + " commits=" + Commits.Count + "\nF11: diagnostics";
             GUI.Label(new Rect(10f, 10f, 900f, 48f), text, style);
         }
 
@@ -308,18 +326,23 @@ namespace FcitxCjkInput {
         }
 
         private static string DecodeHex(string hex) {
+            return Encoding.UTF8.GetString(DecodeHexBytes(hex));
+        }
+
+        private static byte[] DecodeHexBytes(string hex) {
             if ((hex.Length & 1) != 0)
                 throw new FormatException("Odd hex length: " + hex.Length);
             var bytes = new byte[hex.Length / 2];
             for (var i = 0; i < bytes.Length; i++)
                 bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
-            return Encoding.UTF8.GetString(bytes);
+            return bytes;
         }
 
         private static void ClearPreedit(string reason) {
             if (_preedit.Length > 0)
                 WriteLog("STATE preedit clear reason=" + reason + " old=[" + Escape(_preedit) + "]");
             _preedit = "";
+            _preeditCursor = 0;
             _preeditControl = 0;
         }
 
