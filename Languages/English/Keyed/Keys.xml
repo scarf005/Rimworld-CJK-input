@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LanguageData>
+  <FcitxCjkInput_Initializing>FcitxCjkInput: initializing...</FcitxCjkInput_Initializing>
+  <FcitxCjkInput_HelperStarted>FcitxCjkInput: helper process started (pid={pid})</FcitxCjkInput_HelperStarted>
+  <FcitxCjkInput_HelperStopped>FcitxCjkInput: helper process stopped (exit={exitCode})</FcitxCjkInput_HelperStopped>
+  <FcitxCjkInput_HelperFailed>FcitxCjkInput: failed to start helper process: {error}</FcitxCjkInput_HelperFailed>
+  <FcitxCjkInput_CommitText>FcitxCjkInput: commit text [{text}]</FcitxCjkInput_CommitText>
+  <FcitxCjkInput_Preedit>FcitxCjkInput: preedit [{text}] cursor={cursor}</FcitxCjkInput_Preedit>
+  <FcitxCjkInput_KeyForward>FcitxCjkInput: forward key char={char} code={keyCode} mods={modifiers}</FcitxCjkInput_KeyForward>
+  <FcitxCjkInput_NoHelper>FcitxCjkInput: helper not running, skipping key forward</FcitxCjkInput_NoHelper>
+  <FcitxCjkInput_PatchFailed>FcitxCjkInput: Harmony patch failed: {error}</FcitxCjkInput_PatchFailed>
+  <FcitxCjkInput_Initialized>FcitxCjkInput: initialized successfully</FcitxCjkInput_Initialized>
+</LanguageData>

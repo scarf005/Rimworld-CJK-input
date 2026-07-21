@@ -1,0 +1,41 @@
+*.swp
+*.*~
+project.lock.json
+.DS_Store
+*.pyc
+nupkg/
+packages/
+.idea
+.vs/
+.vscode
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+msbuild.log
+msbuild.err
+msbuild.wrn
+*.tar.gz
+.env
+
+# Harmony downloaded
+HarmonyMod.zip
+packages/
+
+# Built assemblies (CI-built, not tracked)
+1.6/Assemblies/*.dll
+1.6/Assemblies/*.so
+
+# Rust build artifacts
+native-rs/target/
