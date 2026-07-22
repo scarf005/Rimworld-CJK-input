@@ -32,7 +32,7 @@ namespace FcitxCjkInput {
         private static int _preeditCursor;
         private static int _preeditControl;
         private static bool _nativeReady;
-        private static bool _overlay = true;
+        private static bool _overlay;
         private static int _overlayFrame = -1;
         private static long _nextNativeRestart;
         private static bool _nativeLoaded;
