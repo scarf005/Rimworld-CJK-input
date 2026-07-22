@@ -97,19 +97,19 @@ namespace FcitxCjkInput {
 
         private static void Patch() {
             var harmony = new Harmony("scarf.fcitxcjkinput");
-            var currentGetter = AccessTools.PropertyGetter(typeof(Event), "current");
+            var rootOnGui = AccessTools.Method(typeof(Root), "OnGUI");
             var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
-            if (currentGetter == null)
-                throw new MissingMethodException("UnityEngine.Event.current getter");
+            if (rootOnGui == null)
+                throw new MissingMethodException("Verse.Root.OnGUI");
             if (desktopTextField == null)
                 throw new MissingMethodException("UnityEngine.GUI.HandleTextFieldEventForDesktop");
 
-            harmony.Patch(currentGetter,
-                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterCurrentEvent)));
+            harmony.Patch(rootOnGui,
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)));
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
-            WriteLog("PATCH Event.current=" + currentGetter + " textField=" + desktopTextField);
+            WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField);
         }
 
         private static void LoadNativeBridge() {
@@ -234,40 +234,40 @@ namespace FcitxCjkInput {
             }
         }
 
-        private static void AfterCurrentEvent(ref Event __result) {
+        private static void BeforeRootOnGui() {
             Pump();
-            if (__result == null)
+            var currentEvent = Event.current;
+            if (currentEvent == null)
                 return;
 
-            if (__result.type == EventType.KeyDown && __result.keyCode == KeyCode.F11) {
+            if (currentEvent.type == EventType.KeyDown && currentEvent.keyCode == KeyCode.F11) {
                 _overlay = !_overlay;
                 WriteLog("UI overlay=" + _overlay);
-                __result.Use();
+                currentEvent.Use();
                 return;
             }
 
-            if (__result.type != EventType.KeyDown || GUIUtility.keyboardControl == 0 ||
+            if (currentEvent.type != EventType.KeyDown || GUIUtility.keyboardControl == 0 ||
                 _engine != "hangul")
                 return;
 
             var shortcutModifiers = EventModifiers.Control | EventModifiers.Command | EventModifiers.Alt;
-            var suppress = (IsHangulLetter(__result.keyCode) &&
-                (__result.modifiers & shortcutModifiers) == 0) ||
-                (__result.keyCode == KeyCode.Backspace && _preedit.Length > 0);
+            var suppress = (IsHangulLetter(currentEvent.keyCode) &&
+                (currentEvent.modifiers & shortcutModifiers) == 0) ||
+                (currentEvent.keyCode == KeyCode.Backspace && _preedit.Length > 0);
             if (!suppress)
                 return;
 
-            WriteLog("KEY suppress control=" + GUIUtility.keyboardControl + " key=" + __result.keyCode +
-                " char=U+" + ((int)__result.character).ToString("X4") +
-                " modifiers=" + __result.modifiers + " preedit=[" + Escape(_preedit) + "]");
-            __result.Use();
+            WriteLog("KEY suppress control=" + GUIUtility.keyboardControl + " key=" + currentEvent.keyCode +
+                " char=U+" + ((int)currentEvent.character).ToString("X4") +
+                " modifiers=" + currentEvent.modifiers + " preedit=[" + Escape(_preedit) + "]");
+            currentEvent.Use();
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style, TextEditor editor,
             ref PreeditDrawState __state) {
             __state = default;
-            Pump();
             if (GUIUtility.keyboardControl != id)
                 return;
 
