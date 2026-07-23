@@ -2,17 +2,18 @@
  * Native fcitx5 signal bridge loaded in-process by FcitxCjkInput.dll.
  *
  * Public API:
+ *   void fcitx_bridge_set_notify(void (*callback)(void *), void *user_data)
  *   int fcitx_bridge_start(uint32_t rimworld_pid)
  *   int fcitx_bridge_poll(char *buffer, int capacity)
- *   int fcitx_bridge_is_running(void)
  *   void fcitx_bridge_stop(void)
  *
- * Poll messages:
+ * Queue messages:
  *   READY:<rimworld-pid>
- *   ENGINE:<unique-name>
- *   PREEDIT_HEX:<UTF-8 byte cursor>:<UTF-8 bytes as hex>
- *   COMMIT_HEX:<UTF-8 bytes as hex>
- *   FOCUS:OUT
+ *   EVENT:<context-id>:<sequence>:ENGINE:<unique-name>
+ *   EVENT:<context-id>:<sequence>:PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:COMMIT:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
+ *   STOPPED
  *   LOG:<diagnostic>
  *   ERROR:<diagnostic>
  */
@@ -33,6 +34,14 @@
 #define MAX_TEXT 4096
 #define MAX_MESSAGE 16384
 #define MAX_DESTINATIONS 16
+#define MAX_CONTEXTS 64
+
+struct context_entry {
+    char destination[128];
+    char path[256];
+};
+
+typedef void (*notify_callback)(void *user_data);
 
 struct message_node {
     char *text;
@@ -48,10 +57,15 @@ static int worker_created;
 static int dbus_threads_ready;
 static volatile int running;
 static uint32_t rimworld_pid;
+static notify_callback queue_notify;
+static void *queue_notify_data;
 
 static DBusConnection *connection;
 static char rimworld_destinations[MAX_DESTINATIONS][128];
 static size_t rimworld_destination_count;
+static struct context_entry contexts[MAX_CONTEXTS];
+static size_t context_count;
+static uint64_t next_sequence;
 
 static void enqueue_message(const char *format, ...) {
     char buffer[MAX_MESSAGE];
@@ -71,10 +85,13 @@ static void enqueue_message(const char *format, ...) {
     node->next = NULL;
 
     pthread_mutex_lock(&queue_mutex);
+    const int notify = queue_head == NULL;
     if (queue_tail) queue_tail->next = node;
     else queue_head = node;
     queue_tail = node;
     pthread_mutex_unlock(&queue_mutex);
+
+    if (notify && queue_notify) queue_notify(queue_notify_data);
 }
 
 static void enqueue_hex(const char *prefix, const char *text) {
@@ -187,6 +204,11 @@ static int become_monitor(void) {
             rimworld_destinations[i]);
         const char *rule = rule_buffer;
         dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='FocusIn',sender='%.127s'",
+            rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
     }
     dbus_message_iter_close_container(&root, &rules);
     uint32_t flags = 0;
@@ -207,13 +229,39 @@ static int become_monitor(void) {
     return 1;
 }
 
-static int is_rimworld_signal(DBusMessage *message) {
-    const char *destination = dbus_message_get_destination(message);
-    if (!destination || destination[0] != ':') return 0;
+static const char *client_name(DBusMessage *message) {
+    return dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_SIGNAL
+        ? dbus_message_get_destination(message)
+        : dbus_message_get_sender(message);
+}
+
+static int is_rimworld_message(DBusMessage *message) {
+    const char *client = client_name(message);
+    if (!client || client[0] != ':') return 0;
     for (size_t i = 0; i < rimworld_destination_count; i++) {
-        if (strcmp(destination, rimworld_destinations[i]) == 0) return 1;
+        if (strcmp(client, rimworld_destinations[i]) == 0) return 1;
     }
     return 0;
+}
+
+static uint32_t context_id(DBusMessage *message) {
+    const char *client = client_name(message);
+    const char *path = dbus_message_get_path(message);
+    if (!client || !path) return 0;
+
+    for (size_t i = 0; i < context_count; i++) {
+        if (strcmp(contexts[i].destination, client) == 0 &&
+            strcmp(contexts[i].path, path) == 0)
+            return (uint32_t)(i + 1);
+    }
+    if (context_count >= MAX_CONTEXTS) return 0;
+
+    struct context_entry *entry = &contexts[context_count++];
+    snprintf(entry->destination, sizeof(entry->destination), "%s", client);
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+    enqueue_message("LOG:context id=%zu destination=%s path=%s",
+        context_count, client, path);
+    return (uint32_t)context_count;
 }
 
 static int read_string(DBusMessage *message, char *buffer, size_t size) {
@@ -265,14 +313,23 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
     return 1;
 }
 
-static void handle_signal(DBusMessage *message) {
-    if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL ||
-        !dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
-        !is_rimworld_signal(message))
+static void handle_message(DBusMessage *message) {
+    if (!dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
+        !is_rimworld_message(message))
         return;
 
     const char *member = dbus_message_get_member(message);
-    if (!member) return;
+    const uint32_t context = context_id(message);
+    if (!member || context == 0) return;
+    const unsigned long long sequence = ++next_sequence;
+    if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_METHOD_CALL) {
+        if (strcmp(member, "FocusIn") == 0) {
+            enqueue_message("LOG:FocusIn context=%u", context);
+            enqueue_message("EVENT:%u:%llu:FOCUS:IN", context, sequence);
+        }
+        return;
+    }
+    if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL) return;
 
     if (strcmp(member, "CurrentIM") == 0) {
         DBusError error;
@@ -285,34 +342,40 @@ static void handle_signal(DBusMessage *message) {
                 DBUS_TYPE_STRING, &unique_name,
                 DBUS_TYPE_STRING, &language,
                 DBUS_TYPE_INVALID)) {
-            enqueue_message("LOG:CurrentIM name=%s unique=%s lang=%s",
-                name, unique_name, language);
-            enqueue_message("ENGINE:%s", unique_name);
+            enqueue_message("LOG:CurrentIM context=%u name=%s unique=%s lang=%s",
+                context, name, unique_name, language);
+            enqueue_message("EVENT:%u:%llu:ENGINE:%s", context, sequence, unique_name);
         } else {
-            enqueue_message("ERROR:CurrentIM parse error=%s", error.message);
+            enqueue_message("ERROR:CurrentIM context=%u error=%s", context,
+                dbus_error_is_set(&error) ? error.message : "invalid signal");
             dbus_error_free(&error);
         }
     } else if (strcmp(member, "CommitString") == 0) {
         char text[MAX_TEXT];
         if (read_string(message, text, sizeof(text))) {
-            enqueue_message("LOG:CommitString bytes=%zu text=%s", strlen(text), text);
-            enqueue_hex("COMMIT_HEX", text);
+            enqueue_message("LOG:CommitString context=%u bytes=%zu text=%s",
+                context, strlen(text), text);
+            char prefix[96];
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:COMMIT",
+                context, sequence);
+            enqueue_hex(prefix, text);
         }
     } else if (strcmp(member, "UpdateFormattedPreedit") == 0) {
         char text[MAX_TEXT];
         int32_t cursor = 0;
         if (read_preedit(message, text, sizeof(text), &cursor)) {
-            enqueue_message("LOG:Preedit cursor=%d bytes=%zu text=%s",
-                cursor, strlen(text), text);
-            char prefix[64];
-            snprintf(prefix, sizeof(prefix), "PREEDIT_HEX:%d", cursor);
+            enqueue_message("LOG:Preedit context=%u cursor=%d bytes=%zu text=%s",
+                context, cursor, strlen(text), text);
+            char prefix[96];
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:PREEDIT:%d",
+                context, sequence, cursor);
             enqueue_hex(prefix, text);
         } else {
-            enqueue_message("ERROR:Preedit parse failed");
+            enqueue_message("ERROR:Preedit context=%u parse failed", context);
         }
     } else if (strcmp(member, "NotifyFocusOut") == 0) {
-        enqueue_message("LOG:NotifyFocusOut");
-        enqueue_message("FOCUS:OUT");
+        enqueue_message("LOG:NotifyFocusOut context=%u", context);
+        enqueue_message("EVENT:%u:%llu:FOCUS:OUT", context, sequence);
     }
 }
 
@@ -333,36 +396,36 @@ static void *monitor_worker(void *unused) {
         enqueue_message("ERROR:session bus error=%s",
             dbus_error_is_set(&error) ? error.message : "unknown");
         dbus_error_free(&error);
-        running = 0;
-        return NULL;
+        goto stopped;
     }
     dbus_connection_set_exit_on_disconnect(connection, FALSE);
 
     if (!discover_rimworld_destinations()) {
         enqueue_message("ERROR:no D-Bus destination for pid=%u", rimworld_pid);
-        close_connection();
-        running = 0;
-        return NULL;
+        goto stopped;
     }
-    if (!become_monitor()) {
-        close_connection();
-        running = 0;
-        return NULL;
-    }
+    if (!become_monitor()) goto stopped;
 
     enqueue_message("READY:%u", rimworld_pid);
     while (running && kill((pid_t)rimworld_pid, 0) == 0) {
         if (!dbus_connection_read_write(connection, 250)) break;
         DBusMessage *message;
         while ((message = dbus_connection_pop_message(connection)) != NULL) {
-            handle_signal(message);
+            handle_message(message);
             dbus_message_unref(message);
         }
     }
 
+stopped:
     close_connection();
     running = 0;
+    enqueue_message("STOPPED");
     return NULL;
+}
+
+EXPORT void fcitx_bridge_set_notify(notify_callback callback, void *user_data) {
+    queue_notify = callback;
+    queue_notify_data = user_data;
 }
 
 EXPORT int fcitx_bridge_start(uint32_t pid) {
@@ -384,6 +447,8 @@ EXPORT int fcitx_bridge_start(uint32_t pid) {
     }
 
     rimworld_pid = pid;
+    context_count = 0;
+    next_sequence = 0;
     running = 1;
     const int result = pthread_create(&worker_thread, NULL, monitor_worker, NULL);
     if (result == 0) worker_created = 1;

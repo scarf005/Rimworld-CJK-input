@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using HarmonyLib;
 using UnityEngine;
 using Verse;
@@ -14,40 +15,50 @@ namespace FcitxCjkInput {
     public static class FcitxCjkInputMod {
         private const string NativeLibraryName = "libfcitxcjkinput.so";
         private const string LogPath = "/tmp/fcitxcjkinput.log";
-        private const double DuplicateCommitSeconds = 0.15;
         private const int RtldNow = 2;
         private const int NativeBufferSize = 16384;
+        private const int NativeRestartDelayMs = 2000;
 
         private static readonly object LogLock = new object();
-        private static readonly Queue<PendingCommit> Commits = new Queue<PendingCommit>();
         private static readonly byte[] NativeBuffer = new byte[NativeBufferSize];
+        private static readonly Dictionary<int, string> Engines = new Dictionary<int, string>();
+        private static readonly Dictionary<int, ControlToken> ControlTokens =
+            new Dictionary<int, ControlToken>();
+        private static readonly CompositionStateMachine Composition =
+            new CompositionStateMachine(Stopwatch.Frequency * 2L);
+        private static readonly NativeNotify NotifyCallback = OnNativeNotify;
+        private static readonly SendOrPostCallback DrainCallback = _ => DrainNativeMessages();
+        private static readonly SendOrPostCallback RestartCallback = _ => RestartNativeBridgeOnMainThread();
 
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
+        private static NativeSetNotify _nativeSetNotify;
         private static NativeStart _nativeStart;
         private static NativePoll _nativePoll;
-        private static NativeIsRunning _nativeIsRunning;
+        private static SynchronizationContext _mainContext;
+        private static System.Threading.Timer _restartTimer;
         private static string _engine = "unknown";
-        private static string _preedit = "";
-        private static int _preeditCursor;
-        private static int _preeditControl;
         private static bool _nativeReady;
         private static bool _overlay;
         private static int _overlayFrame = -1;
-        private static long _nextNativeRestart;
         private static bool _nativeLoaded;
-        private static string _lastQueuedCommit = "";
-        private static int _lastQueuedControl;
-        private static long _lastQueuedTimestamp;
+        private static int _mainThreadId;
+        private static int _nativeDrainRequested;
+        private static int _fallbackRestartRequested;
+        private static int _focusedControl;
+        private static long _focusGeneration;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void NativeNotify(IntPtr userData);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void NativeSetNotify(NativeNotify callback, IntPtr userData);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int NativeStart(uint pid);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int NativePoll([Out] byte[] buffer, int capacity);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate int NativeIsRunning();
 
         [DllImport("libdl.so.2")]
         private static extern IntPtr dlopen(string fileName, int flags);
@@ -57,16 +68,6 @@ namespace FcitxCjkInput {
 
         [DllImport("libdl.so.2")]
         private static extern IntPtr dlerror();
-
-        private struct PendingCommit {
-            public readonly int ControlId;
-            public readonly string Text;
-
-            public PendingCommit(int controlId, string text) {
-                ControlId = controlId;
-                Text = text;
-            }
-        }
 
         private struct PreeditDrawState {
             public bool Active;
@@ -81,11 +82,15 @@ namespace FcitxCjkInput {
                 return;
 
             try {
+                _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+                _mainContext = SynchronizationContext.Current;
                 _log = new StreamWriter(LogPath, false, new UTF8Encoding(false)) { AutoFlush = true };
                 WriteLog("INIT unity=" + Application.unityVersion + " pid=" + Process.GetCurrentProcess().Id +
                     " XMODIFIERS=" + Environment.GetEnvironmentVariable("XMODIFIERS") +
-                    " SDL_IM_MODULE=" + Environment.GetEnvironmentVariable("SDL_IM_MODULE"));
+                    " SDL_IM_MODULE=" + Environment.GetEnvironmentVariable("SDL_IM_MODULE") +
+                    " syncContext=" + (_mainContext?.GetType().FullName ?? "null"));
                 LoadNativeBridge();
+                _nativeSetNotify(NotifyCallback, IntPtr.Zero);
                 Patch();
                 StartNativeBridge();
                 Log.Message("[CJK] fcitx5 SDL/IMGUI bridge initialized; log=" + LogPath);
@@ -123,9 +128,9 @@ namespace FcitxCjkInput {
             if (_nativeHandle == IntPtr.Zero)
                 throw new DllNotFoundException(path + ": " + GetDlError());
 
+            _nativeSetNotify = LoadNativeFunction<NativeSetNotify>("fcitx_bridge_set_notify");
             _nativeStart = LoadNativeFunction<NativeStart>("fcitx_bridge_start");
             _nativePoll = LoadNativeFunction<NativePoll>("fcitx_bridge_poll");
-            _nativeIsRunning = LoadNativeFunction<NativeIsRunning>("fcitx_bridge_is_running");
             _nativeLoaded = true;
             WriteLog("NATIVE loaded path=" + path);
         }
@@ -143,23 +148,50 @@ namespace FcitxCjkInput {
         }
 
         private static void StartNativeBridge() {
-            _nextNativeRestart = DateTime.UtcNow.AddSeconds(2).Ticks;
+            _restartTimer?.Dispose();
+            _restartTimer = null;
             _nativeReady = false;
             var result = _nativeStart((uint)Process.GetCurrentProcess().Id);
             WriteLog("NATIVE start result=" + result);
+            if (result != 0)
+                ScheduleNativeRestart();
         }
 
-        private static void EnsureNativeBridge() {
-            if (!_nativeLoaded || _nativeIsRunning() != 0)
-                return;
-            if (DateTime.UtcNow.Ticks < _nextNativeRestart)
-                return;
-            WriteLog("NATIVE restart requested");
-            StartNativeBridge();
+        private static void RestartNativeBridgeOnMainThread() {
+            if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
+                StartNativeBridge();
+            else
+                Interlocked.Exchange(ref _fallbackRestartRequested, 1);
         }
 
-        private static void Pump() {
-            EnsureNativeBridge();
+        private static void ScheduleNativeRestart() {
+            _restartTimer?.Dispose();
+            _restartTimer = new System.Threading.Timer(_ => {
+                if (_mainContext != null)
+                    _mainContext.Post(RestartCallback, null);
+                else
+                    Interlocked.Exchange(ref _fallbackRestartRequested, 1);
+            }, null, NativeRestartDelayMs, Timeout.Infinite);
+        }
+
+        private static void OnNativeNotify(IntPtr userData) {
+            Interlocked.Exchange(ref _nativeDrainRequested, 1);
+            try {
+                if (_mainContext != null) {
+                    _mainContext.Post(DrainCallback, null);
+                    return;
+                }
+            } catch (Exception exception) {
+                WriteLog("NATIVE notify fallback error=" + exception);
+            }
+        }
+
+        private static void DrainNativeMessages() {
+            if (Thread.CurrentThread.ManagedThreadId != _mainThreadId) {
+                Interlocked.Exchange(ref _nativeDrainRequested, 1);
+                return;
+            }
+            Interlocked.Exchange(ref _nativeDrainRequested, 0);
             if (!_nativeLoaded)
                 return;
 
@@ -168,74 +200,122 @@ namespace FcitxCjkInput {
                 if (length <= 0)
                     break;
                 var line = Encoding.UTF8.GetString(NativeBuffer, 0, length);
-                if (line.StartsWith("LOG:", StringComparison.Ordinal)) {
-                    WriteLog("NATIVE " + line.Substring(4));
-                    continue;
-                }
-                if (line.StartsWith("ERROR:", StringComparison.Ordinal)) {
-                    WriteLog("NATIVE " + line);
-                    continue;
-                }
-                WriteLog("RX " + line);
-                if (line.StartsWith("READY:", StringComparison.Ordinal)) {
-                    _nativeReady = true;
-                } else if (line.StartsWith("ENGINE:", StringComparison.Ordinal)) {
-                    var nextEngine = line.Substring(7);
-                    if (_engine != nextEngine)
-                        WriteLog("STATE engine " + _engine + " -> " + nextEngine);
-                    _engine = nextEngine;
-                    if (_engine != "hangul")
-                        ClearPreedit("engine=" + _engine);
-                } else if (line.StartsWith("PREEDIT_HEX:", StringComparison.Ordinal)) {
-                    var payload = line.Substring(12);
-                    var separator = payload.IndexOf(':');
-                    if (separator < 0)
-                        throw new FormatException("Missing preedit cursor separator: " + line);
-                    var cursorBytes = int.Parse(payload.Substring(0, separator));
-                    var hex = payload.Substring(separator + 1);
-                    var bytes = DecodeHexBytes(hex);
-                    var clampedCursorBytes = Math.Max(0, Math.Min(cursorBytes, bytes.Length));
-                    _preedit = Encoding.UTF8.GetString(bytes);
-                    _preeditCursor = Encoding.UTF8.GetString(bytes, 0, clampedCursorBytes).Length;
-                    _preeditControl = GUIUtility.keyboardControl;
-                    WriteLog("STATE preedit control=" + _preeditControl + " cursorBytes=" + cursorBytes +
-                        " cursorChars=" + _preeditCursor + " text=[" + Escape(_preedit) + "]");
-                } else if (line.StartsWith("COMMIT_HEX:", StringComparison.Ordinal)) {
-                    var text = DecodeHex(line.Substring(11));
-                    var controlId = GUIUtility.keyboardControl;
-                    if (_engine == "hangul" && ContainsNonAscii(text)) {
-                        var timestamp = Stopwatch.GetTimestamp();
-                        var duplicateTicks = DuplicateCommitSeconds * Stopwatch.Frequency;
-                        var isDuplicate = text == _lastQueuedCommit && controlId == _lastQueuedControl &&
-                            timestamp - _lastQueuedTimestamp <= duplicateTicks;
-                        if (isDuplicate) {
-                            WriteLog("DROP duplicate commit control=" + controlId + " text=[" +
-                                Escape(text) + "] ageMs=" +
-                                ((timestamp - _lastQueuedTimestamp) * 1000d / Stopwatch.Frequency).ToString("F1"));
-                        } else {
-                            Commits.Enqueue(new PendingCommit(controlId, text));
-                            _lastQueuedCommit = text;
-                            _lastQueuedControl = controlId;
-                            _lastQueuedTimestamp = timestamp;
-                            WriteLog("QUEUE commit control=" + controlId + " text=[" + Escape(text) +
-                                "] count=" + Commits.Count);
-                        }
-                    } else {
-                        WriteLog("DROP commit engine=" + _engine + " control=" + controlId +
-                            " text=[" + Escape(text) + "] reason=ascii-or-non-hangul");
-                    }
-                } else if (line == "FOCUS:OUT") {
-                    _engine = "unknown";
-                    ClearPreedit("focus-out");
-                    WriteLog("STATE focus out");
-                } else {
-                    WriteLog("RX unknown line=[" + Escape(line) + "]");
+                try {
+                    HandleNativeMessage(line);
+                } catch (Exception exception) {
+                    WriteLog("RX error line=[" + Escape(line) + "] exception=" + exception);
                 }
             }
         }
 
+        private static void HandleNativeMessage(string line) {
+            if (line.StartsWith("LOG:", StringComparison.Ordinal)) {
+                WriteLog("NATIVE " + line.Substring(4));
+                return;
+            }
+            if (line.StartsWith("ERROR:", StringComparison.Ordinal)) {
+                WriteLog("NATIVE " + line);
+                return;
+            }
+
+            WriteLog("RX " + line);
+            if (line.StartsWith("READY:", StringComparison.Ordinal)) {
+                _nativeReady = true;
+                return;
+            }
+            if (line == "STOPPED") {
+                _nativeReady = false;
+                Engines.Clear();
+                Composition.Reset();
+                SetEngine("unknown");
+                ScheduleNativeRestart();
+                return;
+            }
+            if (!line.StartsWith("EVENT:", StringComparison.Ordinal)) {
+                WriteLog("RX unknown line=[" + Escape(line) + "]");
+                return;
+            }
+
+            var parts = line.Split(new[] { ':' }, 5);
+            if (parts.Length != 5 || !int.TryParse(parts[1], out var contextId) ||
+                !long.TryParse(parts[2], out var sequence))
+                throw new FormatException("Invalid native event: " + line);
+            HandleContextEvent(contextId, sequence, parts[3], parts[4]);
+        }
+
+        private static void HandleContextEvent(int contextId, long sequence, string kind, string payload) {
+            var now = Stopwatch.GetTimestamp();
+            if (kind == "ENGINE") {
+                Engines[contextId] = payload;
+                if (payload != "hangul")
+                    Composition.CancelComposition(contextId);
+                if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
+                    SetEngine(payload);
+                return;
+            }
+            if (kind == "FOCUS") {
+                if (payload == "IN") {
+                    Composition.FocusIn(contextId, sequence);
+                    SetEngine(Engines.TryGetValue(contextId, out var engine) ? engine : "unknown");
+                } else if (payload == "OUT" && Composition.FocusOut(contextId, sequence)) {
+                    SetEngine("unknown");
+                }
+                return;
+            }
+            if (kind == "PREEDIT") {
+                var separator = payload.IndexOf(':');
+                if (separator < 0)
+                    throw new FormatException("Missing preedit cursor separator: " + payload);
+                var cursorBytes = int.Parse(payload.Substring(0, separator));
+                var bytes = DecodeHexBytes(payload.Substring(separator + 1));
+                var clampedCursorBytes = Math.Max(0, Math.Min(cursorBytes, bytes.Length));
+                var text = Encoding.UTF8.GetString(bytes);
+                var cursor = Encoding.UTF8.GetString(bytes, 0, clampedCursorBytes).Length;
+                if (Composition.Preedit(contextId, sequence, text, cursor)) {
+                    if (Engines.TryGetValue(contextId, out var engine))
+                        SetEngine(engine);
+                    WriteLog("STATE preedit context=" + contextId + " control=" + _focusedControl +
+                        " cursorBytes=" + cursorBytes + " cursorChars=" + cursor + " text=[" +
+                        Escape(text) + "]");
+                } else {
+                    WriteLog("DROP preedit context=" + contextId + " sequence=" + sequence +
+                        " reason=inactive-or-unbound");
+                }
+                return;
+            }
+            if (kind == "COMMIT") {
+                var text = DecodeHex(payload);
+                Engines.TryGetValue(contextId, out var engine);
+                if (engine == "hangul" && ContainsNonAscii(text) &&
+                    Composition.Commit(contextId, sequence, text, now)) {
+                    WriteLog("QUEUE commit context=" + contextId + " sequence=" + sequence +
+                        " text=[" + Escape(text) + "] count=" + Composition.PendingCount);
+                } else {
+                    WriteLog("DROP commit context=" + contextId + " sequence=" + sequence +
+                        " engine=" + (engine ?? "unknown") + " text=[" + Escape(text) + "]");
+                }
+                return;
+            }
+            WriteLog("RX unknown event kind=" + kind + " payload=[" + Escape(payload) + "]");
+        }
+
+        private static void SetEngine(string engine) {
+            if (_engine != engine)
+                WriteLog("STATE engine " + _engine + " -> " + engine);
+            _engine = engine;
+        }
+
         private static void BeforeRootOnGui() {
-            Pump();
+            if (Interlocked.Exchange(ref _nativeDrainRequested, 0) != 0)
+                DrainNativeMessages();
+            if (Interlocked.Exchange(ref _fallbackRestartRequested, 0) != 0)
+                StartNativeBridge();
+            Composition.DiscardExpired(Stopwatch.GetTimestamp());
+            if (GUIUtility.keyboardControl == 0 && _focusedControl != 0) {
+                _focusedControl = 0;
+                Composition.Blur();
+            }
+
             var currentEvent = Event.current;
             if (currentEvent == null)
                 return;
@@ -247,20 +327,21 @@ namespace FcitxCjkInput {
                 return;
             }
 
-            if (currentEvent.type != EventType.KeyDown || GUIUtility.keyboardControl == 0 ||
-                _engine != "hangul")
+            if (currentEvent.type != EventType.KeyDown || GUIUtility.keyboardControl == 0)
                 return;
 
+            if (_engine != "hangul")
+                return;
             var shortcutModifiers = EventModifiers.Control | EventModifiers.Command | EventModifiers.Alt;
             var suppress = (IsHangulLetter(currentEvent.keyCode) &&
                 (currentEvent.modifiers & shortcutModifiers) == 0) ||
-                (currentEvent.keyCode == KeyCode.Backspace && _preedit.Length > 0);
+                (currentEvent.keyCode == KeyCode.Backspace && Composition.HasPreedit);
             if (!suppress)
                 return;
 
             WriteLog("KEY suppress control=" + GUIUtility.keyboardControl + " key=" + currentEvent.keyCode +
                 " char=U+" + ((int)currentEvent.character).ToString("X4") +
-                " modifiers=" + currentEvent.modifiers + " preedit=[" + Escape(_preedit) + "]");
+                " modifiers=" + currentEvent.modifiers);
             currentEvent.Use();
         }
 
@@ -268,37 +349,27 @@ namespace FcitxCjkInput {
             bool multiline, int maxLength, GUIStyle style, TextEditor editor,
             ref PreeditDrawState __state) {
             __state = default;
-            if (GUIUtility.keyboardControl != id)
+            var target = ObserveEditor(id, editor);
+            if (target.Id == 0)
                 return;
 
-            if (Commits.Count > 0) {
-                var remaining = Commits.Count;
+            var actions = Composition.TakeActions(target, Stopwatch.GetTimestamp());
+            if (actions.Count > 0) {
                 var inserted = new StringBuilder();
-                while (remaining-- > 0) {
-                    var commit = Commits.Dequeue();
-                    if (commit.ControlId != 0 && commit.ControlId != id) {
-                        Commits.Enqueue(commit);
-                        continue;
-                    }
-                    foreach (var character in commit.Text) {
-                        if (maxLength >= 0 && editor.text.Length >= maxLength)
-                            break;
-                        editor.Insert(character);
-                        inserted.Append(character);
-                    }
-                }
-                if (inserted.Length > 0) {
-                    content.text = editor.text;
-                    GUI.changed = true;
-                    WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
-                        Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
-                        editor.cursorIndex + " select=" + editor.selectIndex + " preedit=[" +
-                        Escape(_preedit) + "]");
-                }
+                foreach (var action in actions)
+                    ApplyAction(editor, maxLength, action, inserted);
+                content.text = editor.text;
+                GUI.changed = true;
+                WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
+                    Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
+                    editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
+                    Composition.PendingCount);
+                if (GUIUtility.keyboardControl == id)
+                    Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
             }
 
-            if (Event.current.type != EventType.Repaint || _preeditControl != id ||
-                _preedit.Length == 0)
+            if (Event.current.type != EventType.Repaint || GUIUtility.keyboardControl != id ||
+                !Composition.TryGetView(target, out var view))
                 return;
 
             __state.Active = true;
@@ -307,11 +378,11 @@ namespace FcitxCjkInput {
             __state.CursorIndex = editor.cursorIndex;
             __state.SelectIndex = editor.selectIndex;
 
-            var selectionStart = Math.Min(editor.cursorIndex, editor.selectIndex);
-            var selectionEnd = Math.Max(editor.cursorIndex, editor.selectIndex);
+            var selectionStart = Math.Max(0, Math.Min(view.SelectionStart, editor.text.Length));
+            var selectionEnd = Math.Max(selectionStart, Math.Min(view.SelectionEnd, editor.text.Length));
             var displayText = editor.text.Remove(selectionStart, selectionEnd - selectionStart)
-                .Insert(selectionStart, _preedit);
-            var displayCursor = selectionStart + Math.Min(_preeditCursor, _preedit.Length);
+                .Insert(selectionStart, view.Text);
+            var displayCursor = selectionStart + Math.Min(view.Cursor, view.Text.Length);
             editor.text = displayText;
             content.text = displayText;
             editor.cursorIndex = displayCursor;
@@ -327,10 +398,54 @@ namespace FcitxCjkInput {
                 editor.cursorIndex = __state.CursorIndex;
                 editor.selectIndex = __state.SelectIndex;
             }
+            ObserveEditor(id, editor);
 
             if (Event.current.type == EventType.Repaint && _overlay && _overlayFrame != Time.frameCount) {
                 _overlayFrame = Time.frameCount;
                 DrawOverlay();
+            }
+        }
+
+        private static ControlToken ObserveEditor(int id, TextEditor editor) {
+            if (GUIUtility.keyboardControl == id) {
+                if (_focusedControl != id || !ControlTokens.TryGetValue(id, out var focused)) {
+                    _focusedControl = id;
+                    focused = new ControlToken(id, ++_focusGeneration);
+                    ControlTokens[id] = focused;
+                    WriteLog("STATE focus control=" + id + " generation=" + focused.Generation);
+                }
+                Composition.Focus(focused, editor.cursorIndex, editor.selectIndex);
+                return focused;
+            }
+            return ControlTokens.TryGetValue(id, out var target) ? target : default;
+        }
+
+        private static void ApplyAction(TextEditor editor, int maxLength, CommitAction action,
+            StringBuilder inserted) {
+            var selectionStart = Math.Max(0, Math.Min(action.SelectionStart, editor.text.Length));
+            var selectionEnd = Math.Max(selectionStart, Math.Min(action.SelectionEnd, editor.text.Length));
+            var previousCursor = editor.cursorIndex;
+            var previousSelect = editor.selectIndex;
+            var cursorMoved = Math.Min(previousCursor, previousSelect) != selectionStart ||
+                Math.Max(previousCursor, previousSelect) != selectionEnd;
+            editor.cursorIndex = selectionEnd;
+            editor.selectIndex = selectionStart;
+            var selectedLength = selectionEnd - selectionStart;
+            var allowedLength = maxLength < 0
+                ? action.Text.Length
+                : Math.Max(0, maxLength - (editor.text.Length - selectedLength));
+            var insertedLength = Math.Min(action.Text.Length, allowedLength);
+            for (var i = 0; i < insertedLength; i++) {
+                editor.Insert(action.Text[i]);
+                inserted.Append(action.Text[i]);
+            }
+            if (cursorMoved) {
+                editor.cursorIndex = Math.Max(0, Math.Min(editor.text.Length,
+                    TextEditMath.TransformIndex(previousCursor, selectionStart, selectionEnd,
+                        insertedLength)));
+                editor.selectIndex = Math.Max(0, Math.Min(editor.text.Length,
+                    TextEditMath.TransformIndex(previousSelect, selectionStart, selectionEnd,
+                        insertedLength)));
             }
         }
 
@@ -339,9 +454,14 @@ namespace FcitxCjkInput {
                 fontSize = 13,
                 normal = { textColor = _engine == "hangul" ? Color.green : Color.yellow }
             };
+            var preedit = "";
+            if (ControlTokens.TryGetValue(_focusedControl, out var target) &&
+                Composition.TryGetView(target, out var view))
+                preedit = view.Text;
             var text = "[CJK] engine=" + _engine + " native=" + (_nativeReady ? "ready" : "waiting") +
-                " focus=" + GUIUtility.keyboardControl + " preedit=[" + Escape(_preedit) +
-                "] cursor=" + _preeditCursor + " commits=" + Commits.Count + "\nF11: diagnostics";
+                " focus=" + GUIUtility.keyboardControl + " preedit=[" + Escape(preedit) +
+                "] context=" + Composition.ActiveContext + " commits=" + Composition.PendingCount +
+                "\nF11: diagnostics";
             GUI.Label(new Rect(10f, 10f, 900f, 48f), text, style);
         }
 
@@ -368,14 +488,6 @@ namespace FcitxCjkInput {
             for (var i = 0; i < bytes.Length; i++)
                 bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
             return bytes;
-        }
-
-        private static void ClearPreedit(string reason) {
-            if (_preedit.Length > 0)
-                WriteLog("STATE preedit clear reason=" + reason + " old=[" + Escape(_preedit) + "]");
-            _preedit = "";
-            _preeditCursor = 0;
-            _preeditControl = 0;
         }
 
         private static string Escape(string text) {

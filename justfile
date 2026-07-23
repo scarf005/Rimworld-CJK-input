@@ -22,6 +22,7 @@ build-native:
 # Format C# source
 fmt:
     dotnet format ./Source/{{mod_name}}/{{mod_name}}.sln
+    dotnet format ./Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj
 
 # Build the C# mod
 build-dll:
@@ -29,8 +30,12 @@ build-dll:
     STEAM_OS="{{steam_os}}" \
     mise exec dotnet@8.0.422 -- dotnet build ./Source/{{mod_name}}/{{mod_name}}.csproj -c Release
 
+# Run composition state-machine tests
+test:
+    mise exec dotnet@8.0.422 -- dotnet run --project Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj -c Release
+
 # Build everything
-build: build-native build-dll
+build: test build-native build-dll
 
 # Install built mod to RimWorld Mods directory
 install: build
