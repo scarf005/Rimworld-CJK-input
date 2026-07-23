@@ -7,6 +7,7 @@ internal static class Program {
 
     private static int Main() {
         var tests = new Action[] {
+            PreeditDisplayDoesNotChangeSavedText,
             EndNavigationIsPreservedAfterAnchoredCommit,
             RepeatedSyllablesRemainDistinct,
             CommitClearsPreeditImmediately,
@@ -24,6 +25,13 @@ internal static class Program {
             Console.WriteLine("PASS " + test.Method.Name);
         }
         return 0;
+    }
+
+    private static void PreeditDisplayDoesNotChangeSavedText() {
+        var saved = "";
+        var display = TextEditMath.ReplaceRange(saved, 0, 0, "메");
+        Equal("", saved);
+        Equal("메", display);
     }
 
     private static void EndNavigationIsPreservedAfterAnchoredCommit() {

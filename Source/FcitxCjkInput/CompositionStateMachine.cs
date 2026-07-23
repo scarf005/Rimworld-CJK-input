@@ -3,6 +3,12 @@ using System.Collections.Generic;
 
 namespace FcitxCjkInput {
     internal static class TextEditMath {
+        public static string ReplaceRange(string text, int selectionStart, int selectionEnd,
+            string replacement) {
+            return text.Remove(selectionStart, selectionEnd - selectionStart)
+                .Insert(selectionStart, replacement);
+        }
+
         public static int TransformIndex(int index, int selectionStart, int selectionEnd,
             int insertedLength) {
             if (index <= selectionStart)

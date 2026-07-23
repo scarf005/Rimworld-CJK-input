@@ -24,6 +24,8 @@ namespace FcitxCjkInput {
         private static readonly Dictionary<int, string> Engines = new Dictionary<int, string>();
         private static readonly Dictionary<int, ControlToken> ControlTokens =
             new Dictionary<int, ControlToken>();
+        private static readonly Dictionary<ControlToken, string> ExpectedFieldTexts =
+            new Dictionary<ControlToken, string>();
         private static readonly CompositionStateMachine Composition =
             new CompositionStateMachine(Stopwatch.Frequency * 2L);
         private static readonly NativeNotify NotifyCallback = OnNativeNotify;
@@ -68,14 +70,6 @@ namespace FcitxCjkInput {
 
         [DllImport("libdl.so.2")]
         private static extern IntPtr dlerror();
-
-        private struct PreeditDrawState {
-            public bool Active;
-            public string ContentText;
-            public string EditorText;
-            public int CursorIndex;
-            public int SelectIndex;
-        }
 
         static FcitxCjkInputMod() {
             if (Application.platform != RuntimePlatform.LinuxPlayer)
@@ -346,63 +340,72 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, TextEditor editor,
-            ref PreeditDrawState __state) {
-            __state = default;
+            bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
             var target = ObserveEditor(id, editor);
             if (target.Id == 0)
                 return;
+            VerifyCommittedText(target, id, content, editor);
 
             var actions = Composition.TakeActions(target, Stopwatch.GetTimestamp());
-            if (actions.Count > 0) {
-                var inserted = new StringBuilder();
-                foreach (var action in actions)
-                    ApplyAction(editor, maxLength, action, inserted);
-                content.text = editor.text;
-                GUI.changed = true;
-                WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
-                    Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
-                    editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
-                    Composition.PendingCount);
-                if (GUIUtility.keyboardControl == id)
-                    Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
-            }
-
-            if (Event.current.type != EventType.Repaint || GUIUtility.keyboardControl != id ||
-                !Composition.TryGetView(target, out var view))
+            if (actions.Count == 0)
                 return;
 
-            __state.Active = true;
-            __state.ContentText = content.text;
-            __state.EditorText = editor.text;
-            __state.CursorIndex = editor.cursorIndex;
-            __state.SelectIndex = editor.selectIndex;
-
-            var selectionStart = Math.Max(0, Math.Min(view.SelectionStart, editor.text.Length));
-            var selectionEnd = Math.Max(selectionStart, Math.Min(view.SelectionEnd, editor.text.Length));
-            var displayText = editor.text.Remove(selectionStart, selectionEnd - selectionStart)
-                .Insert(selectionStart, view.Text);
-            var displayCursor = selectionStart + Math.Min(view.Cursor, view.Text.Length);
-            editor.text = displayText;
-            content.text = displayText;
-            editor.cursorIndex = displayCursor;
-            editor.selectIndex = displayCursor;
+            var inserted = new StringBuilder();
+            foreach (var action in actions)
+                ApplyAction(editor, maxLength, action, inserted);
+            content.text = editor.text;
+            ExpectedFieldTexts[target] = editor.text;
+            GUI.changed = true;
+            WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
+                Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
+                editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
+                Composition.PendingCount);
+            if (GUIUtility.keyboardControl == id)
+                Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
-            bool multiline, int maxLength, GUIStyle style, TextEditor editor,
-            PreeditDrawState __state) {
-            if (__state.Active) {
-                content.text = __state.ContentText;
-                editor.text = __state.EditorText;
-                editor.cursorIndex = __state.CursorIndex;
-                editor.selectIndex = __state.SelectIndex;
-            }
-            ObserveEditor(id, editor);
+            bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
+            var target = ObserveEditor(id, editor);
+            if (Event.current.type == EventType.Repaint && GUIUtility.keyboardControl == id &&
+                Composition.TryGetView(target, out var view))
+                DrawPreedit(editor, view);
 
             if (Event.current.type == EventType.Repaint && _overlay && _overlayFrame != Time.frameCount) {
                 _overlayFrame = Time.frameCount;
                 DrawOverlay();
+            }
+        }
+
+        private static void VerifyCommittedText(ControlToken target, int id, GUIContent content,
+            TextEditor editor) {
+            if (!ExpectedFieldTexts.TryGetValue(target, out var expected))
+                return;
+            ExpectedFieldTexts.Remove(target);
+            WriteLog("VERIFY commit control=" + id + " expected=[" + Escape(expected) +
+                "] content=[" + Escape(content.text) + "] editor=[" + Escape(editor.text) +
+                "] event=" + Event.current.type);
+        }
+
+        private static void DrawPreedit(TextEditor editor, CompositionView view) {
+            var originalText = editor.text;
+            var originalCursor = editor.cursorIndex;
+            var originalSelect = editor.selectIndex;
+            var selectionStart = Math.Max(0, Math.Min(view.SelectionStart, originalText.Length));
+            var selectionEnd = Math.Max(selectionStart, Math.Min(view.SelectionEnd, originalText.Length));
+            var displayText = TextEditMath.ReplaceRange(originalText, selectionStart, selectionEnd,
+                view.Text);
+            var displayCursor = selectionStart + Math.Min(view.Cursor, view.Text.Length);
+
+            try {
+                editor.text = displayText;
+                editor.cursorIndex = displayCursor;
+                editor.selectIndex = displayCursor;
+                editor.DrawCursor(displayText);
+            } finally {
+                editor.text = originalText;
+                editor.cursorIndex = originalCursor;
+                editor.selectIndex = originalSelect;
             }
         }
 
