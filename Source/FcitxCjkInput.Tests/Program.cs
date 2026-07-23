@@ -7,6 +7,8 @@ internal static class Program {
 
     private static int Main() {
         var tests = new Action[] {
+            GameplayKeysRemainAvailableOutsideTextFields,
+            TextFieldRawHangulKeysAreSuppressed,
             PreeditDisplayDoesNotChangeSavedText,
             EndNavigationIsPreservedAfterAnchoredCommit,
             RepeatedSyllablesRemainDistinct,
@@ -25,6 +27,16 @@ internal static class Program {
             Console.WriteLine("PASS " + test.Method.Name);
         }
         return 0;
+    }
+
+    private static void GameplayKeysRemainAvailableOutsideTextFields() {
+        Equal(false, InputSuppression.ShouldSuppress(false, true, true, false, false, false));
+    }
+
+    private static void TextFieldRawHangulKeysAreSuppressed() {
+        Equal(true, InputSuppression.ShouldSuppress(true, true, true, false, false, false));
+        Equal(false, InputSuppression.ShouldSuppress(true, false, true, false, false, false));
+        Equal(false, InputSuppression.ShouldSuppress(true, true, true, false, false, true));
     }
 
     private static void PreeditDisplayDoesNotChangeSavedText() {

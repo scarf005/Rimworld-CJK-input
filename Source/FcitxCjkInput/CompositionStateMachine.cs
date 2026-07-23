@@ -19,6 +19,14 @@ namespace FcitxCjkInput {
         }
     }
 
+    internal static class InputSuppression {
+        public static bool ShouldSuppress(bool focusedTextField, bool hangul, bool letter,
+            bool backspace, bool hasPreedit, bool shortcut) {
+            return focusedTextField && hangul &&
+                ((letter && !shortcut) || (backspace && hasPreedit));
+        }
+    }
+
     internal readonly struct ControlToken : IEquatable<ControlToken> {
         public readonly int Id;
         public readonly long Generation;

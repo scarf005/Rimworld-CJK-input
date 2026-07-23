@@ -320,23 +320,6 @@ namespace FcitxCjkInput {
                 currentEvent.Use();
                 return;
             }
-
-            if (currentEvent.type != EventType.KeyDown || GUIUtility.keyboardControl == 0)
-                return;
-
-            if (_engine != "hangul")
-                return;
-            var shortcutModifiers = EventModifiers.Control | EventModifiers.Command | EventModifiers.Alt;
-            var suppress = (IsHangulLetter(currentEvent.keyCode) &&
-                (currentEvent.modifiers & shortcutModifiers) == 0) ||
-                (currentEvent.keyCode == KeyCode.Backspace && Composition.HasPreedit);
-            if (!suppress)
-                return;
-
-            WriteLog("KEY suppress control=" + GUIUtility.keyboardControl + " key=" + currentEvent.keyCode +
-                " char=U+" + ((int)currentEvent.character).ToString("X4") +
-                " modifiers=" + currentEvent.modifiers);
-            currentEvent.Use();
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
@@ -344,6 +327,7 @@ namespace FcitxCjkInput {
             var target = ObserveEditor(id, editor);
             if (target.Id == 0)
                 return;
+            SuppressRawHangulKey(id);
             VerifyCommittedText(target, id, content, editor);
 
             var actions = Composition.TakeActions(target, Stopwatch.GetTimestamp());
@@ -375,6 +359,27 @@ namespace FcitxCjkInput {
                 _overlayFrame = Time.frameCount;
                 DrawOverlay();
             }
+        }
+
+        private static void SuppressRawHangulKey(int id) {
+            var currentEvent = Event.current;
+            if (currentEvent.type != EventType.KeyDown)
+                return;
+            var shortcutModifiers = EventModifiers.Control | EventModifiers.Command | EventModifiers.Alt;
+            var suppress = InputSuppression.ShouldSuppress(
+                focusedTextField: GUIUtility.keyboardControl == id,
+                hangul: _engine == "hangul",
+                letter: IsHangulLetter(currentEvent.keyCode),
+                backspace: currentEvent.keyCode == KeyCode.Backspace,
+                hasPreedit: Composition.HasPreedit,
+                shortcut: (currentEvent.modifiers & shortcutModifiers) != 0);
+            if (!suppress)
+                return;
+
+            WriteLog("KEY suppress control=" + id + " key=" + currentEvent.keyCode +
+                " char=U+" + ((int)currentEvent.character).ToString("X4") +
+                " modifiers=" + currentEvent.modifiers);
+            currentEvent.Use();
         }
 
         private static void VerifyCommittedText(ControlToken target, int id, GUIContent content,
