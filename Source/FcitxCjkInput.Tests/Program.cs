@@ -9,6 +9,7 @@ internal static class Program {
         var tests = new Action[] {
             GameplayKeysRemainAvailableOutsideTextFields,
             TextFieldRawHangulKeysAreSuppressed,
+            BackspaceSuppressionRequiresFocusedPreedit,
             PreeditDisplayDoesNotChangeSavedText,
             EndNavigationIsPreservedAfterAnchoredCommit,
             RepeatedSyllablesRemainDistinct,
@@ -37,6 +38,12 @@ internal static class Program {
         Equal(true, InputSuppression.ShouldSuppress(true, true, true, false, false, false));
         Equal(false, InputSuppression.ShouldSuppress(true, false, true, false, false, false));
         Equal(false, InputSuppression.ShouldSuppress(true, true, true, false, false, true));
+    }
+
+    private static void BackspaceSuppressionRequiresFocusedPreedit() {
+        Equal(true, InputSuppression.ShouldSuppress(true, true, false, true, true, false));
+        Equal(false, InputSuppression.ShouldSuppress(true, true, false, true, false, false));
+        Equal(false, InputSuppression.ShouldSuppress(false, true, false, true, true, false));
     }
 
     private static void PreeditDisplayDoesNotChangeSavedText() {
