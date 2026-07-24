@@ -4,45 +4,46 @@ steam_os := "RimWorldLinux_Data"
 mod_name := "FcitxCjkInput"
 package_id := "scarf.fcitxcjkinput"
 mod_dest := rimworld + "/Mods/" + mod_name
-native_src := "native/fcitxcjkinput.c"
-native_test := "native/fcitxcjkinput_test.c"
+native_rs_dir := "native-rs"
 native_bin := "1.6/Assemblies/libfcitxcjkinput.so"
+fantomas := "dotnet fantomas"
 
 # Download Harmony
 prepare:
     curl -LO https://github.com/pardeike/HarmonyRimWorld/releases/latest/download/HarmonyMod.zip
     7z x -y HarmonyMod.zip -opackages
 
-# Build the in-process native bridge
+# Build the in-process native bridge (Rust)
 build-native:
     mkdir -p "$(dirname {{native_bin}})"
-    gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
-        -o {{native_bin}} {{native_src}} $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
+    cargo build --release --manifest-path {{native_rs_dir}}/Cargo.toml
+    cp {{native_rs_dir}}/target/release/libfcitxcjkinput.so {{native_bin}}
     @echo "Native bridge built: {{native_bin}}"
 
-# Format C# source
+# Format F# source
 fmt:
-    dotnet format ./Source/{{mod_name}}/{{mod_name}}.sln
-    dotnet format ./Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj
+    {{fantomas}} Source/{{mod_name}}
 
-# Test native directional-key events
+# Test native directional-key events (C test against Rust binary)
 test-native:
     output="$(mktemp /tmp/fcitxcjkinput-test.XXXXXX)"; trap 'rm -f "$output"' 0; \
-        gcc -o "$output" {{native_test}} $(pkg-config --cflags --libs dbus-1) \
+        gcc -o "$output" native/fcitxcjkinput_test.c $(pkg-config --cflags --libs dbus-1) \
         -pthread -Wall -Wextra -Werror; "$output"
 
-# Build the C# mod
+# Build the F# mod
 build-dll:
     STEAM_APPS="{{rimworld}}/../.." \
     STEAM_OS="{{steam_os}}" \
-    mise exec dotnet@8.0.422 -- dotnet build ./Source/{{mod_name}}/{{mod_name}}.csproj -c Release
+    mise exec dotnet@8.0.422 -- dotnet build ./Source/{{mod_name}}/{{mod_name}}.fsproj -c Release
 
 # Run composition state-machine tests
 test:
-    mise exec dotnet@8.0.422 -- dotnet run --project Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj -c Release
+    STEAM_APPS="{{rimworld}}/../.." \
+    STEAM_OS="{{steam_os}}" \
+    mise exec dotnet@8.0.422 -- dotnet run --project Source/{{mod_name}}.Tests/{{mod_name}}.Tests.fsproj -c Release
 
 # Build everything
-build: test test-native build-native build-dll
+build: build-native build-dll test test-native
 
 # Install built mod to RimWorld Mods directory
 install: build

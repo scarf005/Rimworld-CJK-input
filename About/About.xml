@@ -9,6 +9,7 @@
   <loadAfter>
     <li>Ludeon.RimWorld</li>
     <li>brrainz.harmony</li>
+    <li>latta.fsharp.core</li>
   </loadAfter>
   <modDependencies>
     <li>
@@ -16,6 +17,11 @@
       <displayName>Harmony</displayName>
       <steamWorkshopUrl>steam://url/CommunityFilePage/2009463077</steamWorkshopUrl>
       <downloadUrl>https://github.com/pardeike/HarmonyRimWorld/releases/latest</downloadUrl>
+    </li>
+    <li>
+      <packageId>latta.fsharp.core</packageId>
+      <displayName>FSharp.Core (latta)</displayName>
+      <steamWorkshopUrl>steam://url/CommunityFilePage/2059725183</steamWorkshopUrl>
     </li>
   </modDependencies>
   <description><![CDATA[Fcitx5 CJK input support for RimWorld on Linux.

@@ -16,6 +16,7 @@
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -35,6 +36,19 @@
     <WarningLevel>4</WarningLevel>
     <OutputPath>../../1.6/Assemblies/</OutputPath>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Core.fs" />
+    <Compile Include="Composition.fs" />
+    <Compile Include="InputRecovery.fs" />
+    <Compile Include="FcitxCjkInput.fs" />
+    <Compile Include="ModSettings.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="FSharp.Core">
+      <HintPath>$(STEAM_APPS)/workshop/content/294100/2059725183/Assemblies/FSharp.Core.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
   <ItemGroup>
     <Reference Include="0Harmony">
       <HintPath>$(MSBuildProjectDirectory)/../../packages/HarmonyMod/Current/Assemblies/0Harmony.dll</HintPath>
