@@ -18,6 +18,7 @@ namespace FcitxCjkInput {
         private const int RtldNow = 2;
         private const int NativeBufferSize = 16384;
         private const int NativeRestartDelayMs = 2000;
+        private const int KeyLogLimit = 256;
 
         private static readonly object LogLock = new object();
         private static readonly byte[] NativeBuffer = new byte[NativeBufferSize];
@@ -45,9 +46,11 @@ namespace FcitxCjkInput {
         private static int _overlayFrame = -1;
         private static bool _nativeLoaded;
         private static int _mainThreadId;
+        private static int _keyLogCount;
         private static int _nativeDrainRequested;
         private static int _fallbackRestartRequested;
         private static int _focusedControl;
+        private static int _focusedTextFieldFrame = -10;
         private static long _focusGeneration;
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -309,10 +312,14 @@ namespace FcitxCjkInput {
                 _focusedControl = 0;
                 Composition.Blur();
             }
+            var textFieldActive = ImeRouting.TextFieldIsActive(GUIUtility.keyboardControl,
+                _focusedControl, _focusedTextFieldFrame, Time.frameCount);
+            SetImeCompositionMode(textFieldActive, "root");
 
             var currentEvent = Event.current;
             if (currentEvent == null)
                 return;
+            LogRootKey(currentEvent, textFieldActive);
 
             if (currentEvent.type == EventType.KeyDown && currentEvent.keyCode == KeyCode.F11) {
                 _overlay = !_overlay;
@@ -363,23 +370,57 @@ namespace FcitxCjkInput {
 
         private static void SuppressRawHangulKey(int id) {
             var currentEvent = Event.current;
-            if (currentEvent.type != EventType.KeyDown)
+            var letter = IsHangulLetter(currentEvent.keyCode);
+            var backspace = currentEvent.keyCode == KeyCode.Backspace;
+            if (currentEvent.type != EventType.KeyDown || (!letter && !backspace))
                 return;
             var shortcutModifiers = EventModifiers.Control | EventModifiers.Command | EventModifiers.Alt;
             var suppress = InputSuppression.ShouldSuppress(
                 focusedTextField: GUIUtility.keyboardControl == id,
                 hangul: _engine == "hangul",
-                letter: IsHangulLetter(currentEvent.keyCode),
-                backspace: currentEvent.keyCode == KeyCode.Backspace,
+                letter: letter,
+                backspace: backspace,
                 hasPreedit: Composition.HasPreedit,
                 shortcut: (currentEvent.modifiers & shortcutModifiers) != 0);
-            if (!suppress)
-                return;
+            if (TryReserveKeyLog())
+                WriteLog("KEY textfield control=" + id + " key=" + currentEvent.keyCode +
+                    " char=U+" + ((int)currentEvent.character).ToString("X4") +
+                    " modifiers=" + currentEvent.modifiers + " engine=" + _engine +
+                    " preedit=" + Composition.HasPreedit + " suppress=" + suppress);
+            if (suppress)
+                currentEvent.Use();
+        }
 
-            WriteLog("KEY suppress control=" + id + " key=" + currentEvent.keyCode +
-                " char=U+" + ((int)currentEvent.character).ToString("X4") +
-                " modifiers=" + currentEvent.modifiers);
-            currentEvent.Use();
+        private static void SetImeCompositionMode(bool textFieldActive, string reason) {
+            var requested = textFieldActive ? IMECompositionMode.On : IMECompositionMode.Off;
+            var previous = Input.imeCompositionMode;
+            if (previous == requested)
+                return;
+            Input.imeCompositionMode = requested;
+            WriteLog("IME mode " + previous + " -> " + Input.imeCompositionMode + " reason=" + reason +
+                " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
+                _focusedControl + " seenFrame=" + _focusedTextFieldFrame + " frame=" +
+                Time.frameCount);
+        }
+
+        private static void LogRootKey(Event currentEvent, bool textFieldActive) {
+            if (currentEvent.type != EventType.KeyDown ||
+                (!IsHangulLetter(currentEvent.keyCode) && currentEvent.keyCode != KeyCode.Backspace))
+                return;
+            if (TryReserveKeyLog())
+                WriteLog("KEY root key=" + currentEvent.keyCode + " char=U+" +
+                    ((int)currentEvent.character).ToString("X4") + " modifiers=" +
+                    currentEvent.modifiers + " engine=" + _engine + " ime=" +
+                    Input.imeCompositionMode + " textFieldActive=" + textFieldActive +
+                    " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
+                    _focusedControl);
+        }
+
+        private static bool TryReserveKeyLog() {
+            if (_keyLogCount >= KeyLogLimit)
+                return false;
+            _keyLogCount++;
+            return true;
         }
 
         private static void VerifyCommittedText(ControlToken target, int id, GUIContent content,
@@ -422,6 +463,8 @@ namespace FcitxCjkInput {
                     ControlTokens[id] = focused;
                     WriteLog("STATE focus control=" + id + " generation=" + focused.Generation);
                 }
+                _focusedTextFieldFrame = Time.frameCount;
+                SetImeCompositionMode(true, "text-field");
                 Composition.Focus(focused, editor.cursorIndex, editor.selectIndex);
                 return focused;
             }

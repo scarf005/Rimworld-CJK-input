@@ -19,6 +19,14 @@ namespace FcitxCjkInput {
         }
     }
 
+    internal static class ImeRouting {
+        public static bool TextFieldIsActive(int keyboardControl, int focusedControl,
+            int lastSeenFrame, int currentFrame) {
+            return keyboardControl != 0 && keyboardControl == focusedControl &&
+                currentFrame - lastSeenFrame <= 1;
+        }
+    }
+
     internal static class InputSuppression {
         public static bool ShouldSuppress(bool focusedTextField, bool hangul, bool letter,
             bool backspace, bool hasPreedit, bool shortcut) {

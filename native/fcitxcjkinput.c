@@ -39,6 +39,7 @@
 struct context_entry {
     char destination[128];
     char path[256];
+    int hangul;
 };
 
 typedef void (*notify_callback)(void *user_data);
@@ -66,6 +67,7 @@ static size_t rimworld_destination_count;
 static struct context_entry contexts[MAX_CONTEXTS];
 static size_t context_count;
 static uint64_t next_sequence;
+static uint32_t key_log_count;
 
 static void enqueue_message(const char *format, ...) {
     char buffer[MAX_MESSAGE];
@@ -209,6 +211,11 @@ static int become_monitor(void) {
             rimworld_destinations[i]);
         rule = rule_buffer;
         dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
+            rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
     }
     dbus_message_iter_close_container(&root, &rules);
     uint32_t flags = 0;
@@ -259,6 +266,7 @@ static uint32_t context_id(DBusMessage *message) {
     struct context_entry *entry = &contexts[context_count++];
     snprintf(entry->destination, sizeof(entry->destination), "%s", client);
     snprintf(entry->path, sizeof(entry->path), "%s", path);
+    entry->hangul = 0;
     enqueue_message("LOG:context id=%zu destination=%s path=%s",
         context_count, client, path);
     return (uint32_t)context_count;
@@ -313,6 +321,35 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
     return 1;
 }
 
+static void log_process_key(DBusMessage *message, uint32_t context) {
+    if (!contexts[context - 1].hangul || key_log_count >= 256) return;
+
+    DBusError error;
+    dbus_error_init(&error);
+    uint32_t keyval = 0;
+    uint32_t keycode = 0;
+    uint32_t state = 0;
+    dbus_bool_t release = FALSE;
+    uint32_t time = 0;
+    if (!dbus_message_get_args(message, &error,
+            DBUS_TYPE_UINT32, &keyval,
+            DBUS_TYPE_UINT32, &keycode,
+            DBUS_TYPE_UINT32, &state,
+            DBUS_TYPE_BOOLEAN, &release,
+            DBUS_TYPE_UINT32, &time,
+            DBUS_TYPE_INVALID)) {
+        enqueue_message("ERROR:ProcessKeyEvent context=%u error=%s", context,
+            dbus_error_is_set(&error) ? error.message : "invalid signal");
+        dbus_error_free(&error);
+        return;
+    }
+    if (!release) {
+        key_log_count++;
+        enqueue_message("LOG:ProcessKeyEvent context=%u keyval=%u keycode=%u state=%u time=%u",
+            context, keyval, keycode, state, time);
+    }
+}
+
 static void handle_message(DBusMessage *message) {
     if (!dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
         !is_rimworld_message(message))
@@ -326,6 +363,8 @@ static void handle_message(DBusMessage *message) {
         if (strcmp(member, "FocusIn") == 0) {
             enqueue_message("LOG:FocusIn context=%u", context);
             enqueue_message("EVENT:%u:%llu:FOCUS:IN", context, sequence);
+        } else if (strcmp(member, "ProcessKeyEvent") == 0) {
+            log_process_key(message, context);
         }
         return;
     }
@@ -342,6 +381,7 @@ static void handle_message(DBusMessage *message) {
                 DBUS_TYPE_STRING, &unique_name,
                 DBUS_TYPE_STRING, &language,
                 DBUS_TYPE_INVALID)) {
+            contexts[context - 1].hangul = strcmp(unique_name, "hangul") == 0;
             enqueue_message("LOG:CurrentIM context=%u name=%s unique=%s lang=%s",
                 context, name, unique_name, language);
             enqueue_message("EVENT:%u:%llu:ENGINE:%s", context, sequence, unique_name);
@@ -449,6 +489,7 @@ EXPORT int fcitx_bridge_start(uint32_t pid) {
     rimworld_pid = pid;
     context_count = 0;
     next_sequence = 0;
+    key_log_count = 0;
     running = 1;
     const int result = pthread_create(&worker_thread, NULL, monitor_worker, NULL);
     if (result == 0) worker_created = 1;

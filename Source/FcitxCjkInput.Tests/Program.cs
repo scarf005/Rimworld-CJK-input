@@ -7,6 +7,7 @@ internal static class Program {
 
     private static int Main() {
         var tests = new Action[] {
+            ImeActivationTracksFreshTextFieldFocus,
             GameplayKeysRemainAvailableOutsideTextFields,
             TextFieldRawHangulKeysAreSuppressed,
             BackspaceSuppressionRequiresFocusedPreedit,
@@ -28,6 +29,13 @@ internal static class Program {
             Console.WriteLine("PASS " + test.Method.Name);
         }
         return 0;
+    }
+
+    private static void ImeActivationTracksFreshTextFieldFocus() {
+        Equal(true, ImeRouting.TextFieldIsActive(7, 7, 99, 100));
+        Equal(false, ImeRouting.TextFieldIsActive(0, 7, 100, 100));
+        Equal(false, ImeRouting.TextFieldIsActive(8, 7, 100, 100));
+        Equal(false, ImeRouting.TextFieldIsActive(7, 7, 98, 100));
     }
 
     private static void GameplayKeysRemainAvailableOutsideTextFields() {
