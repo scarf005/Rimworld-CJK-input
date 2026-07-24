@@ -11,6 +11,12 @@ internal static class Program {
             GameplayKeysRemainAvailableOutsideTextFields,
             TextFieldRawHangulKeysAreSuppressed,
             BackspaceSuppressionRequiresFocusedPreedit,
+            CommittedCharacterIsSuppressedOnce,
+            DifferentCharacterIsNotSuppressedLater,
+            CommittedCharacterSuppressionExpires,
+            HangulDirectionalKeysRecoverCameraInput,
+            DirectionalKeysStayUnavailableInTextFields,
+            ReleasedDirectionalKeysAreNotRecovered,
             PreeditDisplayDoesNotChangeSavedText,
             EndNavigationIsPreservedAfterAnchoredCommit,
             RepeatedSyllablesRemainDistinct,
@@ -52,6 +58,55 @@ internal static class Program {
         Equal(true, InputSuppression.ShouldSuppress(true, true, false, true, true, false));
         Equal(false, InputSuppression.ShouldSuppress(true, true, false, true, false, false));
         Equal(false, InputSuppression.ShouldSuppress(false, true, false, true, true, false));
+    }
+
+    private static void CommittedCharacterIsSuppressedOnce() {
+        var target = new ControlToken(7, 1);
+        var tracker = new CommittedCharacterTracker();
+        tracker.Expect(target, "메", 1, 10);
+
+        Equal(true, tracker.ShouldSuppress(target, '메', 10));
+        Equal(false, tracker.ShouldSuppress(target, '메', 10));
+    }
+
+    private static void DifferentCharacterIsNotSuppressedLater() {
+        var target = new ControlToken(7, 1);
+        var tracker = new CommittedCharacterTracker();
+        tracker.Expect(target, "메", 1, 10);
+
+        Equal(false, tracker.ShouldSuppress(target, '가', 10));
+        Equal(false, tracker.ShouldSuppress(target, '메', 10));
+    }
+
+    private static void CommittedCharacterSuppressionExpires() {
+        var target = new ControlToken(7, 1);
+        var tracker = new CommittedCharacterTracker();
+        tracker.Expect(target, "메", 1, 10);
+
+        Equal(false, tracker.ShouldSuppress(target, '메', 12));
+    }
+
+    private static void HangulDirectionalKeysRecoverCameraInput() {
+        var keys = new DirectionalKeyState();
+        keys.Update('w', false);
+
+        Equal(true, GameplayKeyRecovery.ShouldRecover(false, false, true, 'w', 0, keys));
+        Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, false, 'w', 0, keys));
+    }
+
+    private static void DirectionalKeysStayUnavailableInTextFields() {
+        var keys = new DirectionalKeyState();
+        keys.Update('a', false);
+
+        Equal(false, GameplayKeyRecovery.ShouldRecover(false, true, true, 'a', 0, keys));
+    }
+
+    private static void ReleasedDirectionalKeysAreNotRecovered() {
+        var keys = new DirectionalKeyState();
+        keys.Update('d', false);
+        keys.Update('d', true);
+
+        Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'd', 0, keys));
     }
 
     private static void PreeditDisplayDoesNotChangeSavedText() {

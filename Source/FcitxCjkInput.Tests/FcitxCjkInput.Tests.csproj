@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../FcitxCjkInput/CompositionStateMachine.cs" Link="CompositionStateMachine.cs" />
+    <Compile Include="../FcitxCjkInput/InputRecovery.cs" Link="InputRecovery.cs" />
   </ItemGroup>
 </Project>
