@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using HarmonyLib;
+using RimWorld;
 using UnityEngine;
 using Verse;
 
@@ -18,7 +20,6 @@ namespace FcitxCjkInput {
         private const int RtldNow = 2;
         private const int NativeBufferSize = 16384;
         private const int NativeRestartDelayMs = 2000;
-        private const int KeyLogLimit = 256;
 
         private static readonly object LogLock = new object();
         private static readonly byte[] NativeBuffer = new byte[NativeBufferSize];
@@ -36,6 +37,7 @@ namespace FcitxCjkInput {
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
         private static NativeSetNotify _nativeSetNotify;
+        private static NativeSetDebug _nativeSetDebug;
         private static NativeStart _nativeStart;
         private static NativePoll _nativePoll;
         private static SynchronizationContext _mainContext;
@@ -46,18 +48,23 @@ namespace FcitxCjkInput {
         private static int _overlayFrame = -1;
         private static bool _nativeLoaded;
         private static int _mainThreadId;
-        private static int _keyLogCount;
         private static int _nativeDrainRequested;
         private static int _fallbackRestartRequested;
         private static int _focusedControl;
         private static int _focusedTextFieldFrame = -10;
         private static long _focusGeneration;
+        private static bool _logInitialized;
+
+        private static bool DebugLogging => FcitxCjkInputEntry.Settings?.DebugLog == true;
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void NativeNotify(IntPtr userData);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void NativeSetNotify(NativeNotify callback, IntPtr userData);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void NativeSetDebug(int enabled);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int NativeStart(uint pid);
@@ -81,37 +88,76 @@ namespace FcitxCjkInput {
             try {
                 _mainThreadId = Thread.CurrentThread.ManagedThreadId;
                 _mainContext = SynchronizationContext.Current;
-                _log = new StreamWriter(LogPath, false, new UTF8Encoding(false)) { AutoFlush = true };
-                WriteLog("INIT unity=" + Application.unityVersion + " pid=" + Process.GetCurrentProcess().Id +
-                    " XMODIFIERS=" + Environment.GetEnvironmentVariable("XMODIFIERS") +
-                    " SDL_IM_MODULE=" + Environment.GetEnvironmentVariable("SDL_IM_MODULE") +
-                    " syncContext=" + (_mainContext?.GetType().FullName ?? "null"));
+                EnsureLog();
+                WriteRuntimeHeader("INIT");
                 LoadNativeBridge();
                 _nativeSetNotify(NotifyCallback, IntPtr.Zero);
+                _nativeSetDebug(DebugLogging ? 1 : 0);
                 Patch();
                 StartNativeBridge();
-                Log.Message("[CJK] fcitx5 SDL/IMGUI bridge initialized; log=" + LogPath);
+                Log.Message("[CJK] fcitx5 SDL/IMGUI bridge initialized; " +
+                    (DebugLogging ? "log=" + LogPath : "debug log disabled"));
             } catch (Exception exception) {
                 WriteLog("FATAL " + exception);
                 Log.Error("[CJK] initialization failed: " + exception);
             }
         }
 
+        internal static void SetDebugLogging(bool enabled) {
+            if (enabled)
+                EnsureLog();
+            if (_nativeSetDebug != null)
+                _nativeSetDebug(enabled ? 1 : 0);
+            if (enabled) {
+                WriteRuntimeHeader("DEBUG enabled");
+                Log.Message("[CJK] debug log enabled; log=" + LogPath);
+            } else {
+                ExpectedFieldTexts.Clear();
+                lock (LogLock) {
+                    _log?.Dispose();
+                    _log = null;
+                }
+                Log.Message("[CJK] debug log disabled");
+            }
+        }
+
+        private static void WriteRuntimeHeader(string reason) {
+            WriteLog(reason + " unity=" + Application.unityVersion + " pid=" +
+                Process.GetCurrentProcess().Id + " XMODIFIERS=" +
+                Environment.GetEnvironmentVariable("XMODIFIERS") + " SDL_IM_MODULE=" +
+                Environment.GetEnvironmentVariable("SDL_IM_MODULE") + " syncContext=" +
+                (_mainContext?.GetType().FullName ?? "null") + " engine=" + _engine +
+                " native=" + _nativeReady + " ime=" + Input.imeCompositionMode);
+        }
+
         private static void Patch() {
             var harmony = new Harmony("scarf.fcitxcjkinput");
             var rootOnGui = AccessTools.Method(typeof(Root), "OnGUI");
             var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
+            var quickSearch = AccessTools.Method(typeof(QuickSearchWidget), nameof(QuickSearchWidget.OnGUI));
+            var searchTextSetter = AccessTools.PropertySetter(typeof(QuickSearchFilter),
+                nameof(QuickSearchFilter.Text));
             if (rootOnGui == null)
                 throw new MissingMethodException("Verse.Root.OnGUI");
             if (desktopTextField == null)
                 throw new MissingMethodException("UnityEngine.GUI.HandleTextFieldEventForDesktop");
+            if (quickSearch == null)
+                throw new MissingMethodException("RimWorld.QuickSearchWidget.OnGUI");
+            if (searchTextSetter == null)
+                throw new MissingMethodException("RimWorld.QuickSearchFilter.Text.set");
 
             harmony.Patch(rootOnGui,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)));
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
-            WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField);
+            harmony.Patch(quickSearch,
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeQuickSearch)),
+                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterQuickSearch)));
+            harmony.Patch(searchTextSetter,
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeSearchTextSet)));
+            WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
+                " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter);
         }
 
         private static void LoadNativeBridge() {
@@ -126,6 +172,7 @@ namespace FcitxCjkInput {
                 throw new DllNotFoundException(path + ": " + GetDlError());
 
             _nativeSetNotify = LoadNativeFunction<NativeSetNotify>("fcitx_bridge_set_notify");
+            _nativeSetDebug = LoadNativeFunction<NativeSetDebug>("fcitx_bridge_set_debug");
             _nativeStart = LoadNativeFunction<NativeStart>("fcitx_bridge_start");
             _nativePoll = LoadNativeFunction<NativePoll>("fcitx_bridge_poll");
             _nativeLoaded = true;
@@ -215,7 +262,8 @@ namespace FcitxCjkInput {
                 return;
             }
 
-            WriteLog("RX " + line);
+            if (DebugLogging)
+                WriteLog("RX " + line);
             if (line.StartsWith("READY:", StringComparison.Ordinal)) {
                 _nativeReady = true;
                 return;
@@ -271,10 +319,11 @@ namespace FcitxCjkInput {
                 if (Composition.Preedit(contextId, sequence, text, cursor)) {
                     if (Engines.TryGetValue(contextId, out var engine))
                         SetEngine(engine);
-                    WriteLog("STATE preedit context=" + contextId + " control=" + _focusedControl +
-                        " cursorBytes=" + cursorBytes + " cursorChars=" + cursor + " text=[" +
-                        Escape(text) + "]");
-                } else {
+                    if (DebugLogging)
+                        WriteLog("STATE preedit context=" + contextId + " control=" +
+                            _focusedControl + " cursorBytes=" + cursorBytes + " cursorChars=" +
+                            cursor + " text=[" + Escape(text) + "]");
+                } else if (DebugLogging) {
                     WriteLog("DROP preedit context=" + contextId + " sequence=" + sequence +
                         " reason=inactive-or-unbound");
                 }
@@ -285,9 +334,10 @@ namespace FcitxCjkInput {
                 Engines.TryGetValue(contextId, out var engine);
                 if (engine == "hangul" && ContainsNonAscii(text) &&
                     Composition.Commit(contextId, sequence, text, now)) {
-                    WriteLog("QUEUE commit context=" + contextId + " sequence=" + sequence +
-                        " text=[" + Escape(text) + "] count=" + Composition.PendingCount);
-                } else {
+                    if (DebugLogging)
+                        WriteLog("QUEUE commit context=" + contextId + " sequence=" + sequence +
+                            " text=[" + Escape(text) + "] count=" + Composition.PendingCount);
+                } else if (DebugLogging) {
                     WriteLog("DROP commit context=" + contextId + " sequence=" + sequence +
                         " engine=" + (engine ?? "unknown") + " text=[" + Escape(text) + "]");
                 }
@@ -297,7 +347,7 @@ namespace FcitxCjkInput {
         }
 
         private static void SetEngine(string engine) {
-            if (_engine != engine)
+            if (DebugLogging && _engine != engine)
                 WriteLog("STATE engine " + _engine + " -> " + engine);
             _engine = engine;
         }
@@ -319,7 +369,7 @@ namespace FcitxCjkInput {
             var currentEvent = Event.current;
             if (currentEvent == null)
                 return;
-            LogRootKey(currentEvent, textFieldActive);
+            LogRootEvent(currentEvent, textFieldActive);
 
             if (currentEvent.type == EventType.KeyDown && currentEvent.keyCode == KeyCode.F11) {
                 _overlay = !_overlay;
@@ -332,25 +382,29 @@ namespace FcitxCjkInput {
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
             var target = ObserveEditor(id, editor);
+            LogTextField("FIELD before-original", target, id, content, editor);
             if (target.Id == 0)
                 return;
             SuppressRawHangulKey(id);
-            VerifyCommittedText(target, id, content, editor);
+            if (DebugLogging)
+                VerifyCommittedText(target, id, content, editor);
 
             var actions = Composition.TakeActions(target, Stopwatch.GetTimestamp());
             if (actions.Count == 0)
                 return;
 
-            var inserted = new StringBuilder();
+            var inserted = DebugLogging ? new StringBuilder() : null;
             foreach (var action in actions)
                 ApplyAction(editor, maxLength, action, inserted);
             content.text = editor.text;
-            ExpectedFieldTexts[target] = editor.text;
+            if (DebugLogging)
+                ExpectedFieldTexts[target] = editor.text;
             GUI.changed = true;
-            WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
-                Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
-                editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
-                Composition.PendingCount);
+            if (DebugLogging)
+                WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
+                    Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
+                    editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
+                    Composition.PendingCount);
             if (GUIUtility.keyboardControl == id)
                 Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
         }
@@ -358,6 +412,7 @@ namespace FcitxCjkInput {
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
             var target = ObserveEditor(id, editor);
+            LogTextField("FIELD after-original", target, id, content, editor);
             if (Event.current.type == EventType.Repaint && GUIUtility.keyboardControl == id &&
                 Composition.TryGetView(target, out var view))
                 DrawPreedit(editor, view);
@@ -366,6 +421,30 @@ namespace FcitxCjkInput {
                 _overlayFrame = Time.frameCount;
                 DrawOverlay();
             }
+        }
+
+        private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
+            __state = __instance.filter.Text;
+            if (!DebugLogging)
+                return;
+            WriteLog("SEARCH before filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
+                " text=[" + Escape(__state) + "] focused=" + __instance.CurrentlyFocused() + " " +
+                DescribeEvent());
+        }
+
+        private static void AfterQuickSearch(QuickSearchWidget __instance, string __state) {
+            if (!DebugLogging)
+                return;
+            WriteLog("SEARCH after filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
+                " before=[" + Escape(__state) + "] after=[" + Escape(__instance.filter.Text) +
+                "] focused=" + __instance.CurrentlyFocused() + " " + DescribeEvent());
+        }
+
+        private static void BeforeSearchTextSet(QuickSearchFilter __instance, string value) {
+            if (!DebugLogging)
+                return;
+            WriteLog("SEARCH set filter=" + RuntimeHelpers.GetHashCode(__instance) + " old=[" +
+                Escape(__instance.Text) + "] new=[" + Escape(value) + "] " + DescribeEvent());
         }
 
         private static void SuppressRawHangulKey(int id) {
@@ -382,7 +461,7 @@ namespace FcitxCjkInput {
                 backspace: backspace,
                 hasPreedit: Composition.HasPreedit,
                 shortcut: (currentEvent.modifiers & shortcutModifiers) != 0);
-            if (TryReserveKeyLog())
+            if (DebugLogging)
                 WriteLog("KEY textfield control=" + id + " key=" + currentEvent.keyCode +
                     " char=U+" + ((int)currentEvent.character).ToString("X4") +
                     " modifiers=" + currentEvent.modifiers + " engine=" + _engine +
@@ -397,30 +476,46 @@ namespace FcitxCjkInput {
             if (previous == requested)
                 return;
             Input.imeCompositionMode = requested;
-            WriteLog("IME mode " + previous + " -> " + Input.imeCompositionMode + " reason=" + reason +
-                " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
-                _focusedControl + " seenFrame=" + _focusedTextFieldFrame + " frame=" +
-                Time.frameCount);
+            if (DebugLogging)
+                WriteLog("IME mode " + previous + " -> " + Input.imeCompositionMode + " reason=" +
+                    reason + " keyboardControl=" + GUIUtility.keyboardControl +
+                    " focusedControl=" + _focusedControl + " seenFrame=" +
+                    _focusedTextFieldFrame + " frame=" + Time.frameCount);
         }
 
-        private static void LogRootKey(Event currentEvent, bool textFieldActive) {
-            if (currentEvent.type != EventType.KeyDown ||
-                (!IsHangulLetter(currentEvent.keyCode) && currentEvent.keyCode != KeyCode.Backspace))
+        private static void LogRootEvent(Event currentEvent, bool textFieldActive) {
+            if (!DebugLogging || (currentEvent.type != EventType.KeyDown &&
+                currentEvent.type != EventType.KeyUp))
                 return;
-            if (TryReserveKeyLog())
-                WriteLog("KEY root key=" + currentEvent.keyCode + " char=U+" +
-                    ((int)currentEvent.character).ToString("X4") + " modifiers=" +
-                    currentEvent.modifiers + " engine=" + _engine + " ime=" +
-                    Input.imeCompositionMode + " textFieldActive=" + textFieldActive +
-                    " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
-                    _focusedControl);
+            WriteLog("ROOT " + DescribeEvent() + " engine=" + _engine + " ime=" +
+                Input.imeCompositionMode + " textFieldActive=" + textFieldActive +
+                " keyboardControl=" + GUIUtility.keyboardControl + " focusedControl=" +
+                _focusedControl + " compositionContext=" + Composition.ActiveContext +
+                " preedit=" + Composition.HasPreedit + " pending=" + Composition.PendingCount);
         }
 
-        private static bool TryReserveKeyLog() {
-            if (_keyLogCount >= KeyLogLimit)
-                return false;
-            _keyLogCount++;
-            return true;
+        private static void LogTextField(string stage, ControlToken target, int id, GUIContent content,
+            TextEditor editor) {
+            if (!DebugLogging || (GUIUtility.keyboardControl != id && target.Id == 0))
+                return;
+            WriteLog(stage + " control=" + id + " token=" + target.Id + ":" + target.Generation +
+                " keyboardControl=" + GUIUtility.keyboardControl + " hotControl=" +
+                GUIUtility.hotControl + " contentObject=" + RuntimeHelpers.GetHashCode(content) +
+                " editorObject=" + RuntimeHelpers.GetHashCode(editor) + " content=[" +
+                Escape(content.text) + "] editor=[" + Escape(editor.text) + "] cursor=" +
+                editor.cursorIndex + " select=" + editor.selectIndex + " graphicalCursor=" +
+                editor.graphicalCursorPos + " multiline=" + editor.multiline + " guiChanged=" +
+                GUI.changed + " " + DescribeEvent());
+        }
+
+        private static string DescribeEvent() {
+            var currentEvent = Event.current;
+            return currentEvent == null
+                ? "event=null frame=" + Time.frameCount
+                : "event=" + currentEvent.type + " raw=" + currentEvent.rawType + " key=" +
+                    currentEvent.keyCode + " char=U+" + ((int)currentEvent.character).ToString("X4") +
+                    " modifiers=" + currentEvent.modifiers + " command=[" +
+                    Escape(currentEvent.commandName) + "] frame=" + Time.frameCount;
         }
 
         private static void VerifyCommittedText(ControlToken target, int id, GUIContent content,
@@ -428,9 +523,10 @@ namespace FcitxCjkInput {
             if (!ExpectedFieldTexts.TryGetValue(target, out var expected))
                 return;
             ExpectedFieldTexts.Remove(target);
-            WriteLog("VERIFY commit control=" + id + " expected=[" + Escape(expected) +
-                "] content=[" + Escape(content.text) + "] editor=[" + Escape(editor.text) +
-                "] event=" + Event.current.type);
+            if (DebugLogging)
+                WriteLog("VERIFY commit control=" + id + " expected=[" + Escape(expected) +
+                    "] content=[" + Escape(content.text) + "] editor=[" + Escape(editor.text) +
+                    "] event=" + Event.current.type);
         }
 
         private static void DrawPreedit(TextEditor editor, CompositionView view) {
@@ -443,6 +539,10 @@ namespace FcitxCjkInput {
                 view.Text);
             var displayCursor = selectionStart + Math.Min(view.Cursor, view.Text.Length);
 
+            if (DebugLogging)
+                WriteLog("DRAW preedit original=[" + Escape(originalText) + "] display=[" +
+                    Escape(displayText) + "] selection=" + selectionStart + ":" + selectionEnd +
+                    " displayCursor=" + displayCursor + " " + DescribeEvent());
             try {
                 editor.text = displayText;
                 editor.cursorIndex = displayCursor;
@@ -452,6 +552,10 @@ namespace FcitxCjkInput {
                 editor.text = originalText;
                 editor.cursorIndex = originalCursor;
                 editor.selectIndex = originalSelect;
+                if (DebugLogging)
+                    WriteLog("DRAW restore editor=[" + Escape(editor.text) + "] cursor=" +
+                        editor.cursorIndex + " select=" + editor.selectIndex + " " +
+                        DescribeEvent());
             }
         }
 
@@ -461,7 +565,8 @@ namespace FcitxCjkInput {
                     _focusedControl = id;
                     focused = new ControlToken(id, ++_focusGeneration);
                     ControlTokens[id] = focused;
-                    WriteLog("STATE focus control=" + id + " generation=" + focused.Generation);
+                    if (DebugLogging)
+                        WriteLog("STATE focus control=" + id + " generation=" + focused.Generation);
                 }
                 _focusedTextFieldFrame = Time.frameCount;
                 SetImeCompositionMode(true, "text-field");
@@ -488,7 +593,7 @@ namespace FcitxCjkInput {
             var insertedLength = Math.Min(action.Text.Length, allowedLength);
             for (var i = 0; i < insertedLength; i++) {
                 editor.Insert(action.Text[i]);
-                inserted.Append(action.Text[i]);
+                inserted?.Append(action.Text[i]);
             }
             if (cursorMoved) {
                 editor.cursorIndex = Math.Max(0, Math.Min(editor.text.Length,
@@ -510,7 +615,8 @@ namespace FcitxCjkInput {
                 Composition.TryGetView(target, out var view))
                 preedit = view.Text;
             var text = "[CJK] engine=" + _engine + " native=" + (_nativeReady ? "ready" : "waiting") +
-                " focus=" + GUIUtility.keyboardControl + " preedit=[" + Escape(preedit) +
+                " debug=" + (DebugLogging ? "on" : "off") + " focus=" +
+                GUIUtility.keyboardControl + " preedit=[" + Escape(preedit) +
                 "] context=" + Composition.ActiveContext + " commits=" + Composition.PendingCount +
                 "\nF11: diagnostics";
             GUI.Label(new Rect(10f, 10f, 900f, 48f), text, style);
@@ -547,8 +653,20 @@ namespace FcitxCjkInput {
             return text.Replace("\\", "\\\\").Replace("\r", "\\r").Replace("\n", "\\n");
         }
 
+        private static void EnsureLog() {
+            if (!DebugLogging || _log != null)
+                return;
+            _log = new StreamWriter(LogPath, _logInitialized, new UTF8Encoding(false)) {
+                AutoFlush = true
+            };
+            _logInitialized = true;
+        }
+
         private static void WriteLog(string message) {
+            if (!DebugLogging)
+                return;
             lock (LogLock) {
+                EnsureLog();
                 _log?.WriteLine(DateTimeOffset.Now.ToString("O") + " " + message);
             }
         }

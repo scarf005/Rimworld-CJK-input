@@ -24,6 +24,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,11 +36,22 @@
 #define MAX_MESSAGE 16384
 #define MAX_DESTINATIONS 16
 #define MAX_CONTEXTS 64
+#define MAX_PENDING_KEYS 128
 
 struct context_entry {
     char destination[128];
     char path[256];
     int hangul;
+};
+
+struct pending_key {
+    char client[128];
+    uint32_t serial;
+    uint32_t context;
+    uint32_t keyval;
+    uint32_t keycode;
+    uint32_t state;
+    dbus_bool_t release;
 };
 
 typedef void (*notify_callback)(void *user_data);
@@ -56,7 +68,9 @@ static struct message_node *queue_tail;
 static pthread_t worker_thread;
 static int worker_created;
 static int dbus_threads_ready;
-static volatile int running;
+static atomic_int running;
+static atomic_int debug_logging;
+static atomic_int restart_requested;
 static uint32_t rimworld_pid;
 static notify_callback queue_notify;
 static void *queue_notify_data;
@@ -67,9 +81,13 @@ static size_t rimworld_destination_count;
 static struct context_entry contexts[MAX_CONTEXTS];
 static size_t context_count;
 static uint64_t next_sequence;
-static uint32_t key_log_count;
+static struct pending_key pending_keys[MAX_PENDING_KEYS];
+static size_t next_pending_key;
 
 static void enqueue_message(const char *format, ...) {
+    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) &&
+        strncmp(format, "LOG:", 4) == 0) return;
+
     char buffer[MAX_MESSAGE];
     va_list args;
     va_start(args, format);
@@ -211,11 +229,21 @@ static int become_monitor(void) {
             rimworld_destinations[i]);
         rule = rule_buffer;
         dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        snprintf(rule_buffer, sizeof(rule_buffer),
-            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
-            rimworld_destinations[i]);
-        rule = rule_buffer;
-        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        if (atomic_load_explicit(&debug_logging, memory_order_relaxed)) {
+            snprintf(rule_buffer, sizeof(rule_buffer),
+                "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
+                rimworld_destinations[i]);
+            rule = rule_buffer;
+            dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+            snprintf(rule_buffer, sizeof(rule_buffer),
+                "type='method_return',destination='%.127s'", rimworld_destinations[i]);
+            rule = rule_buffer;
+            dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+            snprintf(rule_buffer, sizeof(rule_buffer),
+                "type='error',destination='%.127s'", rimworld_destinations[i]);
+            rule = rule_buffer;
+            dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        }
     }
     dbus_message_iter_close_container(&root, &rules);
     uint32_t flags = 0;
@@ -242,13 +270,16 @@ static const char *client_name(DBusMessage *message) {
         : dbus_message_get_sender(message);
 }
 
-static int is_rimworld_message(DBusMessage *message) {
-    const char *client = client_name(message);
+static int is_rimworld_destination(const char *client) {
     if (!client || client[0] != ':') return 0;
     for (size_t i = 0; i < rimworld_destination_count; i++) {
         if (strcmp(client, rimworld_destinations[i]) == 0) return 1;
     }
     return 0;
+}
+
+static int is_rimworld_message(DBusMessage *message) {
+    return is_rimworld_destination(client_name(message));
 }
 
 static uint32_t context_id(DBusMessage *message) {
@@ -322,7 +353,7 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
 }
 
 static void log_process_key(DBusMessage *message, uint32_t context) {
-    if (!contexts[context - 1].hangul || key_log_count >= 256) return;
+    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed)) return;
 
     DBusError error;
     dbus_error_init(&error);
@@ -343,14 +374,67 @@ static void log_process_key(DBusMessage *message, uint32_t context) {
         dbus_error_free(&error);
         return;
     }
-    if (!release) {
-        key_log_count++;
-        enqueue_message("LOG:ProcessKeyEvent context=%u keyval=%u keycode=%u state=%u time=%u",
-            context, keyval, keycode, state, time);
+    const uint32_t serial = dbus_message_get_serial(message);
+    struct pending_key *pending = &pending_keys[next_pending_key++ % MAX_PENDING_KEYS];
+    snprintf(pending->client, sizeof(pending->client), "%s", client_name(message));
+    pending->serial = serial;
+    pending->context = context;
+    pending->keyval = keyval;
+    pending->keycode = keycode;
+    pending->state = state;
+    pending->release = release;
+    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u hangul=%d",
+        serial, context, keyval, keycode, state, release, time,
+        contexts[context - 1].hangul);
+}
+
+static void log_process_key_reply(DBusMessage *message) {
+    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) ||
+        !is_rimworld_destination(dbus_message_get_destination(message)))
+        return;
+    const char *client = dbus_message_get_destination(message);
+    const uint32_t reply_serial = dbus_message_get_reply_serial(message);
+    struct pending_key *pending = NULL;
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial == reply_serial &&
+            strcmp(pending_keys[i].client, client) == 0) {
+            pending = &pending_keys[i];
+            break;
+        }
     }
+    if (!pending) return;
+
+    if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_ERROR) {
+        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u release=%d error=%s",
+            reply_serial, pending->context, pending->keyval, pending->keycode,
+            pending->release, dbus_message_get_error_name(message));
+        pending->serial = 0;
+        return;
+    }
+
+    DBusError error;
+    dbus_error_init(&error);
+    dbus_bool_t accepted = FALSE;
+    if (dbus_message_get_args(message, &error, DBUS_TYPE_BOOLEAN, &accepted,
+            DBUS_TYPE_INVALID)) {
+        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u state=%u release=%d accepted=%d",
+            reply_serial, pending->context, pending->keyval, pending->keycode,
+            pending->state, pending->release, accepted);
+    } else {
+        enqueue_message("ERROR:ProcessKeyReply serial=%u context=%u error=%s",
+            reply_serial, pending->context,
+            dbus_error_is_set(&error) ? error.message : "invalid reply");
+        dbus_error_free(&error);
+    }
+    pending->serial = 0;
 }
 
 static void handle_message(DBusMessage *message) {
+    const int type = dbus_message_get_type(message);
+    if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
+        log_process_key_reply(message);
+        return;
+    }
     if (!dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
         !is_rimworld_message(message))
         return;
@@ -447,7 +531,9 @@ static void *monitor_worker(void *unused) {
     if (!become_monitor()) goto stopped;
 
     enqueue_message("READY:%u", rimworld_pid);
-    while (running && kill((pid_t)rimworld_pid, 0) == 0) {
+    while (atomic_load_explicit(&running, memory_order_relaxed) &&
+        !atomic_load_explicit(&restart_requested, memory_order_relaxed) &&
+        kill((pid_t)rimworld_pid, 0) == 0) {
         if (!dbus_connection_read_write(connection, 250)) break;
         DBusMessage *message;
         while ((message = dbus_connection_pop_message(connection)) != NULL) {
@@ -458,7 +544,7 @@ static void *monitor_worker(void *unused) {
 
 stopped:
     close_connection();
-    running = 0;
+    atomic_store_explicit(&running, 0, memory_order_relaxed);
     enqueue_message("STOPPED");
     return NULL;
 }
@@ -466,6 +552,13 @@ stopped:
 EXPORT void fcitx_bridge_set_notify(notify_callback callback, void *user_data) {
     queue_notify = callback;
     queue_notify_data = user_data;
+}
+
+EXPORT void fcitx_bridge_set_debug(int enabled) {
+    const int changed = atomic_exchange_explicit(&debug_logging, enabled != 0,
+        memory_order_relaxed) != (enabled != 0);
+    if (changed && atomic_load_explicit(&running, memory_order_relaxed))
+        atomic_store_explicit(&restart_requested, 1, memory_order_relaxed);
 }
 
 EXPORT int fcitx_bridge_start(uint32_t pid) {
@@ -477,7 +570,7 @@ EXPORT int fcitx_bridge_start(uint32_t pid) {
         }
         dbus_threads_ready = 1;
     }
-    if (running) {
+    if (atomic_load_explicit(&running, memory_order_relaxed)) {
         pthread_mutex_unlock(&state_mutex);
         return 0;
     }
@@ -489,12 +582,14 @@ EXPORT int fcitx_bridge_start(uint32_t pid) {
     rimworld_pid = pid;
     context_count = 0;
     next_sequence = 0;
-    key_log_count = 0;
-    running = 1;
+    atomic_store_explicit(&restart_requested, 0, memory_order_relaxed);
+    memset(pending_keys, 0, sizeof(pending_keys));
+    next_pending_key = 0;
+    atomic_store_explicit(&running, 1, memory_order_relaxed);
     const int result = pthread_create(&worker_thread, NULL, monitor_worker, NULL);
     if (result == 0) worker_created = 1;
     else {
-        running = 0;
+        atomic_store_explicit(&running, 0, memory_order_relaxed);
         enqueue_message("ERROR:pthread_create result=%d", result);
     }
     pthread_mutex_unlock(&state_mutex);
@@ -525,12 +620,12 @@ EXPORT int fcitx_bridge_poll(char *buffer, int capacity) {
 }
 
 EXPORT int fcitx_bridge_is_running(void) {
-    return running;
+    return atomic_load_explicit(&running, memory_order_relaxed);
 }
 
 EXPORT void fcitx_bridge_stop(void) {
     pthread_mutex_lock(&state_mutex);
-    running = 0;
+    atomic_store_explicit(&running, 0, memory_order_relaxed);
     if (worker_created) {
         pthread_join(worker_thread, NULL);
         worker_created = 0;

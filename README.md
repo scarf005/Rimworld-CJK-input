@@ -28,7 +28,7 @@ Unity 2022 creates an SDL2 fcitx5 input context but does not connect its Linux I
 
 The physical IME toggle key remains handled by KWin/fcitx5. The mod does not use `/dev/input`, poll fcitx5 state, create a temporary executable, or start a separate helper process.
 
-Press **F11** to toggle the diagnostic overlay. Detailed diagnostics are written to `/tmp/fcitxcjkinput.log`; the current diagnostic log includes preedit and committed text.
+Press **F11** to toggle the diagnostic overlay. To write verbose diagnostics to `/tmp/fcitxcjkinput.log`, enable **Debug log** under **Options → Mod settings → Fcitx CJK Input**. Debug logging is disabled by default.
 
 ## Build and install
 
