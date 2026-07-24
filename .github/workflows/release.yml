@@ -1,0 +1,111 @@
+# Built from rimworld skill reference ci-build-release.yml
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  RIMWORLD_VERSION: '1.6'
+  MOD_PACKAGE_ID: scarf.fcitxcjkinput
+  SOLUTION_FILE: Source/FcitxCjkInput/FcitxCjkInput.csproj
+  ASSEMBLY_DIR: 1.6/Assemblies
+  RIMWORLD_REF: /tmp/rimworld-refs
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc libdbus-1-dev pkg-config p7zip-full curl lib32gcc-s1 steamcmd
+
+      - name: cache RimWorld assemblies
+        id: cache-rw
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RIMWORLD_REF }}
+          key: rimworld-${{ env.RIMWORLD_VERSION }}-refs-v1
+
+      - name: download RimWorld assemblies
+        if: steps.cache-rw.outputs.cache-hit != 'true'
+        run: |
+          steamcmd +force_install_dir "$RIMWORLD_REF" \
+            +login anonymous \
+            +app_update 294100 -beta "$RIMWORLD_VERSION" validate \
+            +quit
+
+      - name: download Harmony
+        run: |
+          curl -sLO https://github.com/pardeike/HarmonyRimWorld/releases/latest/download/HarmonyMod.zip
+          7z x -y HarmonyMod.zip -opackages
+
+      - name: build native bridge (.so)
+        run: |
+          mkdir -p "$ASSEMBLY_DIR"
+          gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
+            -o "$ASSEMBLY_DIR/libfcitxcjkinput.so" \
+            native/fcitxcjkinput.c \
+            $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: build mod assembly (.dll)
+        run: |
+          dotnet build "$SOLUTION_FILE" -c Release \
+            -p:STEAM_APPS="$RIMWORLD_REF" \
+            -p:STEAM_OS="RimWorldLinux_Data"
+
+      - name: verify built artifacts
+        run: |
+          ls -la "$ASSEMBLY_DIR/"
+          test -f "$ASSEMBLY_DIR/FcitxCjkInput.dll"
+          test -f "$ASSEMBLY_DIR/libfcitxcjkinput.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MOD_PACKAGE_ID }}-${{ github.ref_name }}
+          path: ${{ env.ASSEMBLY_DIR }}/
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOD_PACKAGE_ID }}-${{ github.ref_name }}
+          path: ${{ env.ASSEMBLY_DIR }}
+
+      - name: create mod archive
+        run: |
+          pkg="$MOD_PACKAGE_ID"
+          ver="$RIMWORLD_VERSION"
+          mkdir -p "dist/$pkg/$ver/Assemblies"
+          # metadata
+          cp -r About "dist/$pkg/"
+          # assemblies
+          cp "$ASSEMBLY_DIR"/*.dll "$ASSEMBLY_DIR"/*.so \
+            "dist/$pkg/$ver/Assemblies/" 2>/dev/null || true
+          # optional mod directories
+          for dir in Defs Languages Patches Textures; do
+            [ -d "$dir" ] && cp -r "$dir" "dist/$pkg/"
+          done
+          cd dist && zip -r "../$pkg-${{ github.ref_name }}.zip" "$pkg"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.MOD_PACKAGE_ID }}-${{ github.ref_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
