@@ -16,6 +16,7 @@ internal static class Program {
             DifferentCharacterIsNotSuppressedLater,
             CommittedCharacterSuppressionExpires,
             HangulDirectionalKeysRecoverCameraInput,
+            HangulShortcutPressesSurviveTheirReleaseUntilGuiHandling,
             UnrelatedKeysAreNotRecovered,
             DirectionalKeysStayUnavailableInTextFields,
             ReleasedDirectionalKeysAreNotRecovered,
@@ -107,11 +108,30 @@ internal static class Program {
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, false, 'w', 0, keys));
     }
 
-    private static void UnrelatedKeysAreNotRecovered() {
+    private static void HangulShortcutPressesSurviveTheirReleaseUntilGuiHandling() {
         var keys = new DirectionalKeyState();
         keys.Update('q', false);
+        keys.Update('q', true);
+        keys.Update('e', false);
+        keys.Update('e', true);
+        keys.Update('z', false);
+        keys.Update('z', true);
 
-        Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'q', 0, keys));
+        Equal(true, keys.WasPressed('q'));
+        Equal(true, keys.WasPressed('e'));
+        Equal(true, keys.WasPressed('z'));
+        keys.ClearPressed();
+        Equal(false, keys.WasPressed('q'));
+        Equal(false, keys.WasPressed('e'));
+        Equal(false, keys.WasPressed('z'));
+    }
+
+    private static void UnrelatedKeysAreNotRecovered() {
+        var keys = new DirectionalKeyState();
+        keys.Update('r', false);
+
+        Equal(false, keys.IsDown('r'));
+        Equal(false, keys.WasPressed('r'));
     }
 
     private static void DirectionalKeysStayUnavailableInTextFields() {
