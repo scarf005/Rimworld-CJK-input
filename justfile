@@ -39,6 +39,7 @@ build: test build-native build-dll
 
 # Install built mod to RimWorld Mods directory
 install: build
+    @pgrep -x RimWorldLinux >/dev/null 2>&1 && { echo "RimWorld is running — 설치 전에 종료해주세요"; exit 1; } || true
     mkdir -p "{{mod_dest}}/1.6/Assemblies"
     mkdir -p "{{mod_dest}}/About"
     cp -r 1.6/Assemblies/* "{{mod_dest}}/1.6/Assemblies/"
