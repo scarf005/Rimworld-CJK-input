@@ -54,28 +54,44 @@ namespace FcitxCjkInput {
         }
     }
 
-    internal sealed class DirectionalKeyState {
+    internal sealed class GameplayKeyState {
         private const int A = 1 << 0;
         private const int D = 1 << 1;
         private const int S = 1 << 2;
         private const int W = 1 << 3;
+        private const int Q = 1 << 4;
+        private const int E = 1 << 5;
+        private const int Z = 1 << 6;
 
+        private int _down;
         private int _pressed;
 
         public void Update(int keyValue, bool release) {
             var mask = MaskFor(keyValue);
-            if (release)
-                _pressed &= ~mask;
-            else
+            if (release) {
+                _down &= ~mask;
+            } else {
+                _down |= mask;
                 _pressed |= mask;
+            }
         }
 
         public bool IsDown(int keyCode) {
             var mask = MaskFor(keyCode);
+            return mask != 0 && (_down & mask) != 0;
+        }
+
+        public bool WasPressed(int keyCode) {
+            var mask = MaskFor(keyCode);
             return mask != 0 && (_pressed & mask) != 0;
         }
 
+        public void ClearPressed() {
+            _pressed = 0;
+        }
+
         public void Clear() {
+            _down = 0;
             _pressed = 0;
         }
 
@@ -93,6 +109,15 @@ namespace FcitxCjkInput {
                 case 'w':
                 case 'W':
                     return W;
+                case 'q':
+                case 'Q':
+                    return Q;
+                case 'e':
+                case 'E':
+                    return E;
+                case 'z':
+                case 'Z':
+                    return Z;
                 default:
                     return 0;
             }
@@ -101,9 +126,15 @@ namespace FcitxCjkInput {
 
     internal static class GameplayKeyRecovery {
         public static bool ShouldRecover(bool original, bool textFieldActive, bool cameraDolly,
-            int primaryKey, int secondaryKey, DirectionalKeyState keys) {
+            int primaryKey, int secondaryKey, GameplayKeyState keys) {
             return original || (!textFieldActive && cameraDolly &&
                 (keys.IsDown(primaryKey) || keys.IsDown(secondaryKey)));
+        }
+
+        public static bool ShouldRecoverPress(bool original, bool textFieldActive,
+            bool gameplayShortcut, int primaryKey, int secondaryKey, GameplayKeyState keys) {
+            return original || (!textFieldActive && gameplayShortcut &&
+                (keys.WasPressed(primaryKey) || keys.WasPressed(secondaryKey)));
         }
     }
 }

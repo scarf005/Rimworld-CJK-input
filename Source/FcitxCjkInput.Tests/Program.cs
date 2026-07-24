@@ -101,7 +101,7 @@ internal static class Program {
     }
 
     private static void HangulDirectionalKeysRecoverCameraInput() {
-        var keys = new DirectionalKeyState();
+        var keys = new GameplayKeyState();
         keys.Update('w', false);
 
         Equal(true, GameplayKeyRecovery.ShouldRecover(false, false, true, 'w', 0, keys));
@@ -109,7 +109,7 @@ internal static class Program {
     }
 
     private static void HangulShortcutPressesSurviveTheirReleaseUntilGuiHandling() {
-        var keys = new DirectionalKeyState();
+        var keys = new GameplayKeyState();
         keys.Update('q', false);
         keys.Update('q', true);
         keys.Update('e', false);
@@ -120,6 +120,14 @@ internal static class Program {
         Equal(true, keys.WasPressed('q'));
         Equal(true, keys.WasPressed('e'));
         Equal(true, keys.WasPressed('z'));
+        Equal(true, GameplayKeyRecovery.ShouldRecoverPress(false, false, true,
+            'q', 0, keys));
+        Equal(true, GameplayKeyRecovery.ShouldRecoverPress(false, false, true,
+            0, 'e', keys));
+        Equal(false, GameplayKeyRecovery.ShouldRecoverPress(false, true, true,
+            'z', 0, keys));
+        Equal(false, GameplayKeyRecovery.ShouldRecoverPress(false, false, false,
+            'z', 0, keys));
         keys.ClearPressed();
         Equal(false, keys.WasPressed('q'));
         Equal(false, keys.WasPressed('e'));
@@ -127,7 +135,7 @@ internal static class Program {
     }
 
     private static void UnrelatedKeysAreNotRecovered() {
-        var keys = new DirectionalKeyState();
+        var keys = new GameplayKeyState();
         keys.Update('r', false);
 
         Equal(false, keys.IsDown('r'));
@@ -135,14 +143,14 @@ internal static class Program {
     }
 
     private static void DirectionalKeysStayUnavailableInTextFields() {
-        var keys = new DirectionalKeyState();
+        var keys = new GameplayKeyState();
         keys.Update('a', false);
 
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, true, true, 'a', 0, keys));
     }
 
     private static void ReleasedDirectionalKeysAreNotRecovered() {
-        var keys = new DirectionalKeyState();
+        var keys = new GameplayKeyState();
         keys.Update('d', false);
         keys.Update('d', true);
 
@@ -150,7 +158,7 @@ internal static class Program {
     }
 
     private static void ClearingDirectionalKeysPreventsStuckMovement() {
-        var keys = new DirectionalKeyState();
+        var keys = new GameplayKeyState();
         keys.Update('s', false);
         keys.Clear();
 

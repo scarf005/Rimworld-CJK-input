@@ -32,7 +32,7 @@ namespace FcitxCjkInput {
             new CompositionStateMachine(Stopwatch.Frequency * 2L);
         private static readonly CommittedCharacterTracker CommittedCharacters =
             new CommittedCharacterTracker();
-        private static readonly DirectionalKeyState DirectionalKeys = new DirectionalKeyState();
+        private static readonly GameplayKeyState GameplayKeys = new GameplayKeyState();
         private static readonly NativeNotify NotifyCallback = OnNativeNotify;
         private static readonly SendOrPostCallback DrainCallback = _ => DrainNativeMessages();
         private static readonly SendOrPostCallback RestartCallback = _ => RestartNativeBridgeOnMainThread();
@@ -143,6 +143,10 @@ namespace FcitxCjkInput {
                 nameof(QuickSearchFilter.Text));
             var keyBindingIsDown = AccessTools.PropertyGetter(typeof(KeyBindingDef),
                 nameof(KeyBindingDef.IsDown));
+            var keyBindingKeyDownEvent = AccessTools.PropertyGetter(typeof(KeyBindingDef),
+                nameof(KeyBindingDef.KeyDownEvent));
+            var keyBindingJustPressed = AccessTools.PropertyGetter(typeof(KeyBindingDef),
+                nameof(KeyBindingDef.JustPressed));
             if (rootOnGui == null)
                 throw new MissingMethodException("Verse.Root.OnGUI");
             if (desktopTextField == null)
@@ -153,9 +157,14 @@ namespace FcitxCjkInput {
                 throw new MissingMethodException("RimWorld.QuickSearchFilter.Text.set");
             if (keyBindingIsDown == null)
                 throw new MissingMethodException("Verse.KeyBindingDef.IsDown.get");
+            if (keyBindingKeyDownEvent == null)
+                throw new MissingMethodException("Verse.KeyBindingDef.KeyDownEvent.get");
+            if (keyBindingJustPressed == null)
+                throw new MissingMethodException("Verse.KeyBindingDef.JustPressed.get");
 
             harmony.Patch(rootOnGui,
-                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)));
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)),
+                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterRootOnGui)));
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
@@ -166,9 +175,16 @@ namespace FcitxCjkInput {
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeSearchTextSet)));
             harmony.Patch(keyBindingIsDown,
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterKeyBindingIsDown)));
+            harmony.Patch(keyBindingKeyDownEvent,
+                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
+                    nameof(AfterKeyBindingKeyDownEvent)));
+            harmony.Patch(keyBindingJustPressed,
+                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
+                    nameof(AfterKeyBindingJustPressed)));
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
                 " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
-                " keyBindingIsDown=" + keyBindingIsDown);
+                " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
+                keyBindingKeyDownEvent + " keyBindingJustPressed=" + keyBindingJustPressed);
         }
 
         private static void LoadNativeBridge() {
@@ -284,7 +300,7 @@ namespace FcitxCjkInput {
                 Engines.Clear();
                 Composition.Reset();
                 CommittedCharacters.Clear();
-                DirectionalKeys.Clear();
+                GameplayKeys.Clear();
                 SetEngine("unknown");
                 ScheduleNativeRestart();
                 return;
@@ -307,7 +323,7 @@ namespace FcitxCjkInput {
                 Engines[contextId] = payload;
                 if (payload != "hangul") {
                     Composition.CancelComposition(contextId);
-                    DirectionalKeys.Clear();
+                    GameplayKeys.Clear();
                 }
                 if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
                     SetEngine(payload);
@@ -318,7 +334,7 @@ namespace FcitxCjkInput {
                     Composition.FocusIn(contextId, sequence);
                     SetEngine(Engines.TryGetValue(contextId, out var engine) ? engine : "unknown");
                 } else if (payload == "OUT") {
-                    DirectionalKeys.Clear();
+                    GameplayKeys.Clear();
                     if (Composition.FocusOut(contextId, sequence))
                         SetEngine("unknown");
                 }
@@ -330,7 +346,7 @@ namespace FcitxCjkInput {
                     throw new FormatException("Missing key release separator: " + payload);
                 var keyValue = int.Parse(payload.Substring(0, separator));
                 var release = int.Parse(payload.Substring(separator + 1)) != 0;
-                DirectionalKeys.Update(keyValue, release);
+                GameplayKeys.Update(keyValue, release);
                 return;
             }
             if (kind == "PREEDIT") {
@@ -406,6 +422,11 @@ namespace FcitxCjkInput {
             }
         }
 
+        private static void AfterRootOnGui() {
+            if (Event.current?.rawType == EventType.KeyDown)
+                GameplayKeys.ClearPressed();
+        }
+
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
             bool multiline, int maxLength, GUIStyle style, TextEditor editor) {
             var target = ObserveEditor(id, editor);
@@ -477,14 +498,37 @@ namespace FcitxCjkInput {
         }
 
         private static void AfterKeyBindingIsDown(KeyBindingDef __instance, ref bool __result) {
-            if (__result || _textFieldActive || !IsCameraDolly(__instance) ||
-                Find.WindowStack.AnySearchWidgetFocused)
+            RecoverKeyBinding(__instance, ref __result, IsCameraDolly(__instance), pressed: false);
+        }
+
+        private static void AfterKeyBindingKeyDownEvent(KeyBindingDef __instance,
+            ref bool __result) {
+            var rotate = __instance == KeyBindingDefOf.Designator_RotateLeft ||
+                __instance == KeyBindingDefOf.Designator_RotateRight;
+            RecoverKeyBinding(__instance, ref __result, rotate, pressed: true);
+        }
+
+        private static void AfterKeyBindingJustPressed(KeyBindingDef __instance,
+            ref bool __result) {
+            RecoverKeyBinding(__instance, ref __result,
+                __instance == KeyBindingDefOf.OpenMapSearch, pressed: true);
+        }
+
+        private static void RecoverKeyBinding(KeyBindingDef bindingDef, ref bool result,
+            bool gameplayShortcut, bool pressed) {
+            var currentEvent = Event.current;
+            if (result || _textFieldActive || !gameplayShortcut ||
+                Find.WindowStack.AnySearchWidgetFocused ||
+                (pressed && (currentEvent == null || currentEvent.rawType != EventType.KeyDown)))
                 return;
             var preferences = KeyPrefs.KeyPrefsData;
-            if (preferences == null || !preferences.keyPrefs.TryGetValue(__instance, out var binding))
+            if (preferences == null || !preferences.keyPrefs.TryGetValue(bindingDef, out var binding))
                 return;
-            __result = GameplayKeyRecovery.ShouldRecover(__result, _textFieldActive, true,
-                (int)binding.keyBindingA, (int)binding.keyBindingB, DirectionalKeys);
+            result = pressed
+                ? GameplayKeyRecovery.ShouldRecoverPress(result, _textFieldActive, true,
+                    (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys)
+                : GameplayKeyRecovery.ShouldRecover(result, _textFieldActive, true,
+                    (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys);
         }
 
         private static bool IsCameraDolly(KeyBindingDef binding) {

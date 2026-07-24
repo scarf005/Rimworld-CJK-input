@@ -353,9 +353,11 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
     return 1;
 }
 
-static int is_directional_key(uint32_t keyval) {
+static int is_recoverable_key(uint32_t keyval) {
     return keyval == 'a' || keyval == 'A' || keyval == 'd' || keyval == 'D' ||
-        keyval == 's' || keyval == 'S' || keyval == 'w' || keyval == 'W';
+        keyval == 's' || keyval == 'S' || keyval == 'w' || keyval == 'W' ||
+        keyval == 'q' || keyval == 'Q' || keyval == 'e' || keyval == 'E' ||
+        keyval == 'z' || keyval == 'Z';
 }
 
 static void handle_process_key(DBusMessage *message, uint32_t context,
@@ -379,7 +381,7 @@ static void handle_process_key(DBusMessage *message, uint32_t context,
         dbus_error_free(&error);
         return;
     }
-    if (contexts[context - 1].hangul && is_directional_key(keyval))
+    if (contexts[context - 1].hangul && is_recoverable_key(keyval))
         enqueue_message("EVENT:%u:%llu:KEY:%u:%d", context, sequence, keyval, release);
 
     if (!atomic_load_explicit(&debug_logging, memory_order_relaxed)) return;

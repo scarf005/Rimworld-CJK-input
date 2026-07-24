@@ -50,10 +50,16 @@ int main(void) {
     expect_message("EVENT:1:8:KEY:119:1");
 
     handle_key('q', FALSE, 9);
+    expect_message("EVENT:1:9:KEY:113:0");
+    handle_key('e', FALSE, 10);
+    expect_message("EVENT:1:10:KEY:101:0");
+    handle_key('z', FALSE, 11);
+    expect_message("EVENT:1:11:KEY:122:0");
+    handle_key('r', FALSE, 12);
     expect_no_message();
 
     contexts[0].hangul = 0;
-    handle_key('w', FALSE, 10);
+    handle_key('w', FALSE, 13);
     expect_no_message();
     return 0;
 }
