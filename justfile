@@ -5,6 +5,7 @@ mod_name := "FcitxCjkInput"
 package_id := "scarf.fcitxcjkinput"
 mod_dest := rimworld + "/Mods/" + mod_name
 native_src := "native/fcitxcjkinput.c"
+native_test := "native/fcitxcjkinput_test.c"
 native_bin := "1.6/Assemblies/libfcitxcjkinput.so"
 
 # Download Harmony
@@ -24,6 +25,12 @@ fmt:
     dotnet format ./Source/{{mod_name}}/{{mod_name}}.sln
     dotnet format ./Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj
 
+# Test native directional-key events
+test-native:
+    output="$(mktemp /tmp/fcitxcjkinput-test.XXXXXX)"; trap 'rm -f "$output"' 0; \
+        gcc -o "$output" {{native_test}} $(pkg-config --cflags --libs dbus-1) \
+        -pthread -Wall -Wextra -Werror; "$output"
+
 # Build the C# mod
 build-dll:
     STEAM_APPS="{{rimworld}}/../.." \
@@ -35,7 +42,7 @@ test:
     mise exec dotnet@8.0.422 -- dotnet run --project Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj -c Release
 
 # Build everything
-build: test build-native build-dll
+build: test test-native build-native build-dll
 
 # Install built mod to RimWorld Mods directory
 install: build

@@ -30,6 +30,9 @@ namespace FcitxCjkInput {
             new Dictionary<ControlToken, string>();
         private static readonly CompositionStateMachine Composition =
             new CompositionStateMachine(Stopwatch.Frequency * 2L);
+        private static readonly CommittedCharacterTracker CommittedCharacters =
+            new CommittedCharacterTracker();
+        private static readonly DirectionalKeyState DirectionalKeys = new DirectionalKeyState();
         private static readonly NativeNotify NotifyCallback = OnNativeNotify;
         private static readonly SendOrPostCallback DrainCallback = _ => DrainNativeMessages();
         private static readonly SendOrPostCallback RestartCallback = _ => RestartNativeBridgeOnMainThread();
@@ -54,6 +57,7 @@ namespace FcitxCjkInput {
         private static int _focusedTextFieldFrame = -10;
         private static long _focusGeneration;
         private static bool _logInitialized;
+        private static bool _textFieldActive;
 
         private static bool DebugLogging => FcitxCjkInputEntry.Settings?.DebugLog == true;
 
@@ -137,6 +141,8 @@ namespace FcitxCjkInput {
             var quickSearch = AccessTools.Method(typeof(QuickSearchWidget), nameof(QuickSearchWidget.OnGUI));
             var searchTextSetter = AccessTools.PropertySetter(typeof(QuickSearchFilter),
                 nameof(QuickSearchFilter.Text));
+            var keyBindingIsDown = AccessTools.PropertyGetter(typeof(KeyBindingDef),
+                nameof(KeyBindingDef.IsDown));
             if (rootOnGui == null)
                 throw new MissingMethodException("Verse.Root.OnGUI");
             if (desktopTextField == null)
@@ -145,6 +151,8 @@ namespace FcitxCjkInput {
                 throw new MissingMethodException("RimWorld.QuickSearchWidget.OnGUI");
             if (searchTextSetter == null)
                 throw new MissingMethodException("RimWorld.QuickSearchFilter.Text.set");
+            if (keyBindingIsDown == null)
+                throw new MissingMethodException("Verse.KeyBindingDef.IsDown.get");
 
             harmony.Patch(rootOnGui,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)));
@@ -156,8 +164,11 @@ namespace FcitxCjkInput {
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterQuickSearch)));
             harmony.Patch(searchTextSetter,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeSearchTextSet)));
+            harmony.Patch(keyBindingIsDown,
+                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterKeyBindingIsDown)));
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
-                " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter);
+                " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
+                " keyBindingIsDown=" + keyBindingIsDown);
         }
 
         private static void LoadNativeBridge() {
@@ -272,6 +283,8 @@ namespace FcitxCjkInput {
                 _nativeReady = false;
                 Engines.Clear();
                 Composition.Reset();
+                CommittedCharacters.Clear();
+                DirectionalKeys.Clear();
                 SetEngine("unknown");
                 ScheduleNativeRestart();
                 return;
@@ -292,8 +305,10 @@ namespace FcitxCjkInput {
             var now = Stopwatch.GetTimestamp();
             if (kind == "ENGINE") {
                 Engines[contextId] = payload;
-                if (payload != "hangul")
+                if (payload != "hangul") {
                     Composition.CancelComposition(contextId);
+                    DirectionalKeys.Clear();
+                }
                 if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
                     SetEngine(payload);
                 return;
@@ -302,9 +317,20 @@ namespace FcitxCjkInput {
                 if (payload == "IN") {
                     Composition.FocusIn(contextId, sequence);
                     SetEngine(Engines.TryGetValue(contextId, out var engine) ? engine : "unknown");
-                } else if (payload == "OUT" && Composition.FocusOut(contextId, sequence)) {
-                    SetEngine("unknown");
+                } else if (payload == "OUT") {
+                    DirectionalKeys.Clear();
+                    if (Composition.FocusOut(contextId, sequence))
+                        SetEngine("unknown");
                 }
+                return;
+            }
+            if (kind == "KEY") {
+                var separator = payload.IndexOf(':');
+                if (separator < 0)
+                    throw new FormatException("Missing key release separator: " + payload);
+                var keyValue = int.Parse(payload.Substring(0, separator));
+                var release = int.Parse(payload.Substring(separator + 1)) != 0;
+                DirectionalKeys.Update(keyValue, release);
                 return;
             }
             if (kind == "PREEDIT") {
@@ -364,6 +390,7 @@ namespace FcitxCjkInput {
             }
             var textFieldActive = ImeRouting.TextFieldIsActive(GUIUtility.keyboardControl,
                 _focusedControl, _focusedTextFieldFrame, Time.frameCount);
+            _textFieldActive = textFieldActive;
             SetImeCompositionMode(textFieldActive, "root");
 
             var currentEvent = Event.current;
@@ -390,23 +417,25 @@ namespace FcitxCjkInput {
                 VerifyCommittedText(target, id, content, editor);
 
             var actions = Composition.TakeActions(target, Stopwatch.GetTimestamp());
-            if (actions.Count == 0)
-                return;
-
-            var inserted = DebugLogging ? new StringBuilder() : null;
-            foreach (var action in actions)
-                ApplyAction(editor, maxLength, action, inserted);
-            content.text = editor.text;
-            if (DebugLogging)
-                ExpectedFieldTexts[target] = editor.text;
-            GUI.changed = true;
-            if (DebugLogging)
-                WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
-                    Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
-                    editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
-                    Composition.PendingCount);
-            if (GUIUtility.keyboardControl == id)
-                Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
+            if (actions.Count > 0) {
+                var inserted = DebugLogging ? new StringBuilder() : null;
+                foreach (var action in actions) {
+                    var insertedLength = ApplyAction(editor, maxLength, action, inserted);
+                    CommittedCharacters.Expect(target, action.Text, insertedLength, Time.frameCount);
+                }
+                content.text = editor.text;
+                if (DebugLogging)
+                    ExpectedFieldTexts[target] = editor.text;
+                GUI.changed = true;
+                if (DebugLogging)
+                    WriteLog("INSERT event=" + Event.current.type + " control=" + id + " text=[" +
+                        Escape(inserted.ToString()) + "] result=[" + Escape(editor.text) + "] cursor=" +
+                        editor.cursorIndex + " select=" + editor.selectIndex + " pending=" +
+                        Composition.PendingCount);
+                if (GUIUtility.keyboardControl == id)
+                    Composition.Focus(target, editor.cursorIndex, editor.selectIndex);
+            }
+            SuppressCommittedCharacter(target, id);
         }
 
         private static void AfterDesktopTextField(Rect position, int id, GUIContent content,
@@ -447,6 +476,24 @@ namespace FcitxCjkInput {
                 Escape(__instance.Text) + "] new=[" + Escape(value) + "] " + DescribeEvent());
         }
 
+        private static void AfterKeyBindingIsDown(KeyBindingDef __instance, ref bool __result) {
+            if (__result || _textFieldActive || !IsCameraDolly(__instance) ||
+                Find.WindowStack.AnySearchWidgetFocused)
+                return;
+            var preferences = KeyPrefs.KeyPrefsData;
+            if (preferences == null || !preferences.keyPrefs.TryGetValue(__instance, out var binding))
+                return;
+            __result = GameplayKeyRecovery.ShouldRecover(__result, _textFieldActive, true,
+                (int)binding.keyBindingA, (int)binding.keyBindingB, DirectionalKeys);
+        }
+
+        private static bool IsCameraDolly(KeyBindingDef binding) {
+            return binding == KeyBindingDefOf.MapDolly_Left ||
+                binding == KeyBindingDefOf.MapDolly_Right ||
+                binding == KeyBindingDefOf.MapDolly_Up ||
+                binding == KeyBindingDefOf.MapDolly_Down;
+        }
+
         private static void SuppressRawHangulKey(int id) {
             var currentEvent = Event.current;
             var letter = IsHangulLetter(currentEvent.keyCode);
@@ -468,6 +515,17 @@ namespace FcitxCjkInput {
                     " preedit=" + Composition.HasPreedit + " suppress=" + suppress);
             if (suppress)
                 currentEvent.Use();
+        }
+
+        private static void SuppressCommittedCharacter(ControlToken target, int id) {
+            var currentEvent = Event.current;
+            if (currentEvent == null ||
+                !CommittedCharacters.ShouldSuppress(target, currentEvent.character, Time.frameCount))
+                return;
+            if (DebugLogging)
+                WriteLog("KEY duplicate-commit control=" + id + " char=U+" +
+                    ((int)currentEvent.character).ToString("X4") + " " + DescribeEvent());
+            currentEvent.character = '\0';
         }
 
         private static void SetImeCompositionMode(bool textFieldActive, string reason) {
@@ -569,6 +627,7 @@ namespace FcitxCjkInput {
                         WriteLog("STATE focus control=" + id + " generation=" + focused.Generation);
                 }
                 _focusedTextFieldFrame = Time.frameCount;
+                _textFieldActive = true;
                 SetImeCompositionMode(true, "text-field");
                 Composition.Focus(focused, editor.cursorIndex, editor.selectIndex);
                 return focused;
@@ -576,7 +635,7 @@ namespace FcitxCjkInput {
             return ControlTokens.TryGetValue(id, out var target) ? target : default;
         }
 
-        private static void ApplyAction(TextEditor editor, int maxLength, CommitAction action,
+        private static int ApplyAction(TextEditor editor, int maxLength, CommitAction action,
             StringBuilder inserted) {
             var selectionStart = Math.Max(0, Math.Min(action.SelectionStart, editor.text.Length));
             var selectionEnd = Math.Max(selectionStart, Math.Min(action.SelectionEnd, editor.text.Length));
@@ -603,6 +662,7 @@ namespace FcitxCjkInput {
                     TextEditMath.TransformIndex(previousSelect, selectionStart, selectionEnd,
                         insertedLength)));
             }
+            return insertedLength;
         }
 
         private static void DrawOverlay() {

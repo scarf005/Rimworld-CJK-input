@@ -12,11 +12,14 @@ internal static class Program {
             TextFieldRawHangulKeysAreSuppressed,
             BackspaceSuppressionRequiresFocusedPreedit,
             CommittedCharacterIsSuppressedOnce,
+            MultipleCommittedCharactersAreSuppressedInOrder,
             DifferentCharacterIsNotSuppressedLater,
             CommittedCharacterSuppressionExpires,
             HangulDirectionalKeysRecoverCameraInput,
+            UnrelatedKeysAreNotRecovered,
             DirectionalKeysStayUnavailableInTextFields,
             ReleasedDirectionalKeysAreNotRecovered,
+            ClearingDirectionalKeysPreventsStuckMovement,
             PreeditDisplayDoesNotChangeSavedText,
             EndNavigationIsPreservedAfterAnchoredCommit,
             RepeatedSyllablesRemainDistinct,
@@ -69,6 +72,16 @@ internal static class Program {
         Equal(false, tracker.ShouldSuppress(target, '메', 10));
     }
 
+    private static void MultipleCommittedCharactersAreSuppressedInOrder() {
+        var target = new ControlToken(7, 1);
+        var tracker = new CommittedCharacterTracker();
+        tracker.Expect(target, "검색", 2, 10);
+
+        Equal(true, tracker.ShouldSuppress(target, '검', 10));
+        Equal(true, tracker.ShouldSuppress(target, '색', 11));
+        Equal(false, tracker.ShouldSuppress(target, '색', 11));
+    }
+
     private static void DifferentCharacterIsNotSuppressedLater() {
         var target = new ControlToken(7, 1);
         var tracker = new CommittedCharacterTracker();
@@ -94,6 +107,13 @@ internal static class Program {
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, false, 'w', 0, keys));
     }
 
+    private static void UnrelatedKeysAreNotRecovered() {
+        var keys = new DirectionalKeyState();
+        keys.Update('q', false);
+
+        Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'q', 0, keys));
+    }
+
     private static void DirectionalKeysStayUnavailableInTextFields() {
         var keys = new DirectionalKeyState();
         keys.Update('a', false);
@@ -107,6 +127,14 @@ internal static class Program {
         keys.Update('d', true);
 
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'd', 0, keys));
+    }
+
+    private static void ClearingDirectionalKeysPreventsStuckMovement() {
+        var keys = new DirectionalKeyState();
+        keys.Update('s', false);
+        keys.Clear();
+
+        Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 's', 0, keys));
     }
 
     private static void PreeditDisplayDoesNotChangeSavedText() {

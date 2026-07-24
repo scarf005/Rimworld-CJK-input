@@ -13,6 +13,7 @@
  *   EVENT:<context-id>:<sequence>:PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
  *   EVENT:<context-id>:<sequence>:COMMIT:<UTF-8 hex>
  *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
+ *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>
  *   STOPPED
  *   LOG:<diagnostic>
  *   ERROR:<diagnostic>
@@ -229,12 +230,12 @@ static int become_monitor(void) {
             rimworld_destinations[i]);
         rule = rule_buffer;
         dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
+            rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
         if (atomic_load_explicit(&debug_logging, memory_order_relaxed)) {
-            snprintf(rule_buffer, sizeof(rule_buffer),
-                "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
-                rimworld_destinations[i]);
-            rule = rule_buffer;
-            dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
             snprintf(rule_buffer, sizeof(rule_buffer),
                 "type='method_return',destination='%.127s'", rimworld_destinations[i]);
             rule = rule_buffer;
@@ -352,9 +353,13 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
     return 1;
 }
 
-static void log_process_key(DBusMessage *message, uint32_t context) {
-    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed)) return;
+static int is_directional_key(uint32_t keyval) {
+    return keyval == 'a' || keyval == 'A' || keyval == 'd' || keyval == 'D' ||
+        keyval == 's' || keyval == 'S' || keyval == 'w' || keyval == 'W';
+}
 
+static void handle_process_key(DBusMessage *message, uint32_t context,
+    unsigned long long sequence) {
     DBusError error;
     dbus_error_init(&error);
     uint32_t keyval = 0;
@@ -374,6 +379,11 @@ static void log_process_key(DBusMessage *message, uint32_t context) {
         dbus_error_free(&error);
         return;
     }
+    if (contexts[context - 1].hangul && is_directional_key(keyval))
+        enqueue_message("EVENT:%u:%llu:KEY:%u:%d", context, sequence, keyval, release);
+
+    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed)) return;
+
     const uint32_t serial = dbus_message_get_serial(message);
     struct pending_key *pending = &pending_keys[next_pending_key++ % MAX_PENDING_KEYS];
     snprintf(pending->client, sizeof(pending->client), "%s", client_name(message));
@@ -448,7 +458,7 @@ static void handle_message(DBusMessage *message) {
             enqueue_message("LOG:FocusIn context=%u", context);
             enqueue_message("EVENT:%u:%llu:FOCUS:IN", context, sequence);
         } else if (strcmp(member, "ProcessKeyEvent") == 0) {
-            log_process_key(message, context);
+            handle_process_key(message, context, sequence);
         }
         return;
     }
