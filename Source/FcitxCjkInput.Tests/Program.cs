@@ -17,6 +17,7 @@ internal static class Program {
             CommittedCharacterSuppressionExpires,
             HangulDirectionalKeysRecoverCameraInput,
             HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent,
+            ShortcutPressesExpireInsteadOfFiringLater,
             UnrelatedKeysAreNotRecovered,
             DirectionalKeysStayUnavailableInTextFields,
             ReleasedDirectionalKeysAreNotRecovered,
@@ -101,58 +102,67 @@ internal static class Program {
     }
 
     private static void HangulDirectionalKeysRecoverCameraInput() {
-        var keys = new GameplayKeyState();
-        keys.Update('w', false);
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('w', false, 100);
 
         Equal(true, GameplayKeyRecovery.ShouldRecover(false, false, true, 'w', 0, keys));
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, false, 'w', 0, keys));
     }
 
     private static void HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent() {
-        var keys = new GameplayKeyState();
-        keys.Update('q', false);
-        keys.Update('q', true);
-        keys.Update('e', false);
-        keys.Update('e', true);
-        keys.Update('z', false);
-        keys.Update('z', true);
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('q', false, 100);
+        keys.Update('q', true, 101);
+        keys.Update('e', false, 102);
+        keys.Update('e', true, 103);
+        keys.Update('z', false, 104);
+        keys.Update('z', true, 105);
 
-        Equal(true, keys.ConsumePress('q'));
-        Equal(false, keys.ConsumePress('q'));
-        Equal(true, keys.ConsumePress('e'));
-        Equal(true, keys.ConsumePress('z'));
-        Equal(false, keys.ConsumePress('z'));
-        keys.Update('z', false);
-        keys.ClearPressed();
-        Equal(false, keys.ConsumePress('z'));
+        Equal(true, keys.ConsumePress('q', 105));
+        Equal(false, keys.ConsumePress('q', 105));
+        Equal(true, keys.ConsumePress('e', 105));
+        Equal(true, keys.ConsumePress('z', 105));
+        Equal(false, keys.ConsumePress('z', 105));
+    }
+
+    private static void ShortcutPressesExpireInsteadOfFiringLater() {
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('z', false, 100);
+
+        Equal(true, keys.ConsumePress('z', 100 + Lifetime));
+        keys.Update('z', false, 200);
+        Equal(false, keys.ConsumePress('z', 200 + Lifetime + 1));
+        keys.Update('q', false, 300);
+        keys.DiscardExpired(300 + Lifetime + 1);
+        Equal(false, keys.ConsumePress('q', 300 + Lifetime + 1));
     }
 
     private static void UnrelatedKeysAreNotRecovered() {
-        var keys = new GameplayKeyState();
-        keys.Update('r', false);
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('r', false, 100);
 
         Equal(false, keys.IsDown('r'));
-        Equal(false, keys.ConsumePress('r'));
+        Equal(false, keys.ConsumePress('r', 100));
     }
 
     private static void DirectionalKeysStayUnavailableInTextFields() {
-        var keys = new GameplayKeyState();
-        keys.Update('a', false);
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('a', false, 100);
 
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, true, true, 'a', 0, keys));
     }
 
     private static void ReleasedDirectionalKeysAreNotRecovered() {
-        var keys = new GameplayKeyState();
-        keys.Update('d', false);
-        keys.Update('d', true);
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('d', false, 100);
+        keys.Update('d', true, 101);
 
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'd', 0, keys));
     }
 
     private static void ClearingDirectionalKeysPreventsStuckMovement() {
-        var keys = new GameplayKeyState();
-        keys.Update('s', false);
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('s', false, 100);
         keys.Clear();
 
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 's', 0, keys));
