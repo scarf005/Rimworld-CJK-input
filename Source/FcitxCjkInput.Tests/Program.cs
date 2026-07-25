@@ -122,6 +122,9 @@ internal static class Program {
         Equal(true, keys.ConsumePress('e'));
         Equal(true, keys.ConsumePress('z'));
         Equal(false, keys.ConsumePress('z'));
+        keys.Update('z', false);
+        keys.ClearPressed();
+        Equal(false, keys.ConsumePress('z'));
     }
 
     private static void UnrelatedKeysAreNotRecovered() {

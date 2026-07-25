@@ -81,9 +81,12 @@ namespace FcitxCjkInput {
             return mask != 0 && (_down & mask) != 0;
         }
 
-        public bool WasPressed(int keyCode) {
+        public bool ConsumePress(int keyCode) {
             var mask = MaskFor(keyCode);
-            return mask != 0 && (_pressed & mask) != 0;
+            if (mask == 0 || (_pressed & mask) == 0)
+                return false;
+            _pressed &= ~mask;
+            return true;
         }
 
         public void ClearPressed() {
@@ -134,7 +137,7 @@ namespace FcitxCjkInput {
         public static bool ShouldRecoverPress(bool original, bool textFieldActive,
             bool gameplayShortcut, int primaryKey, int secondaryKey, GameplayKeyState keys) {
             return original || (!textFieldActive && gameplayShortcut &&
-                (keys.WasPressed(primaryKey) || keys.WasPressed(secondaryKey)));
+                (keys.ConsumePress(primaryKey) || keys.ConsumePress(secondaryKey)));
         }
     }
 }

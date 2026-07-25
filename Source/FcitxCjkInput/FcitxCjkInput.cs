@@ -145,8 +145,8 @@ namespace FcitxCjkInput {
                 nameof(KeyBindingDef.IsDown));
             var keyBindingKeyDownEvent = AccessTools.PropertyGetter(typeof(KeyBindingDef),
                 nameof(KeyBindingDef.KeyDownEvent));
-            var keyBindingJustPressed = AccessTools.PropertyGetter(typeof(KeyBindingDef),
-                nameof(KeyBindingDef.JustPressed));
+            var playSettingsControls = AccessTools.Method(typeof(PlaySettings),
+                nameof(PlaySettings.DoPlaySettingsGlobalControls));
             if (rootOnGui == null)
                 throw new MissingMethodException("Verse.Root.OnGUI");
             if (desktopTextField == null)
@@ -159,8 +159,9 @@ namespace FcitxCjkInput {
                 throw new MissingMethodException("Verse.KeyBindingDef.IsDown.get");
             if (keyBindingKeyDownEvent == null)
                 throw new MissingMethodException("Verse.KeyBindingDef.KeyDownEvent.get");
-            if (keyBindingJustPressed == null)
-                throw new MissingMethodException("Verse.KeyBindingDef.JustPressed.get");
+            if (playSettingsControls == null)
+                throw new MissingMethodException(
+                    "RimWorld.PlaySettings.DoPlaySettingsGlobalControls");
 
             harmony.Patch(rootOnGui,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)),
@@ -178,13 +179,13 @@ namespace FcitxCjkInput {
             harmony.Patch(keyBindingKeyDownEvent,
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
                     nameof(AfterKeyBindingKeyDownEvent)));
-            harmony.Patch(keyBindingJustPressed,
+            harmony.Patch(playSettingsControls,
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod),
-                    nameof(AfterKeyBindingJustPressed)));
+                    nameof(AfterPlaySettingsControls)));
             WriteLog("PATCH Root.OnGUI=" + rootOnGui + " textField=" + desktopTextField +
                 " quickSearch=" + quickSearch + " searchTextSetter=" + searchTextSetter +
                 " keyBindingIsDown=" + keyBindingIsDown + " keyBindingKeyDownEvent=" +
-                keyBindingKeyDownEvent + " keyBindingJustPressed=" + keyBindingJustPressed);
+                keyBindingKeyDownEvent + " playSettingsControls=" + playSettingsControls);
         }
 
         private static void LoadNativeBridge() {
@@ -423,8 +424,7 @@ namespace FcitxCjkInput {
         }
 
         private static void AfterRootOnGui() {
-            if (Event.current?.rawType == EventType.KeyDown)
-                GameplayKeys.ClearPressed();
+            GameplayKeys.ClearPressed();
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
@@ -508,26 +508,37 @@ namespace FcitxCjkInput {
             RecoverKeyBinding(__instance, ref __result, rotate, pressed: true);
         }
 
-        private static void AfterKeyBindingJustPressed(KeyBindingDef __instance,
-            ref bool __result) {
-            RecoverKeyBinding(__instance, ref __result,
-                __instance == KeyBindingDefOf.OpenMapSearch, pressed: true);
+        private static void AfterPlaySettingsControls(bool worldView) {
+            if (!TryRecoverKeyBinding(KeyBindingDefOf.OpenMapSearch, pressed: true))
+                return;
+            if (DebugLogging)
+                WriteLog("RECOVER binding=" + KeyBindingDefOf.OpenMapSearch.defName + " " +
+                    DescribeEvent());
+            if (worldView)
+                Find.WindowStack.Add(new Dialog_WorldSearch());
+            else if (Find.CurrentMap != null)
+                Find.WindowStack.Add(new Dialog_MapSearch(Find.CurrentMap));
         }
 
         private static void RecoverKeyBinding(KeyBindingDef bindingDef, ref bool result,
             bool gameplayShortcut, bool pressed) {
-            var currentEvent = Event.current;
-            if (result || _textFieldActive || !gameplayShortcut ||
-                Find.WindowStack.AnySearchWidgetFocused ||
-                (pressed && (currentEvent == null || currentEvent.rawType != EventType.KeyDown)))
+            if (result || !gameplayShortcut)
                 return;
+            result = TryRecoverKeyBinding(bindingDef, pressed);
+            if (result && DebugLogging)
+                WriteLog("RECOVER binding=" + bindingDef.defName + " " + DescribeEvent());
+        }
+
+        private static bool TryRecoverKeyBinding(KeyBindingDef bindingDef, bool pressed) {
+            if (_textFieldActive || Find.WindowStack.AnySearchWidgetFocused)
+                return false;
             var preferences = KeyPrefs.KeyPrefsData;
             if (preferences == null || !preferences.keyPrefs.TryGetValue(bindingDef, out var binding))
-                return;
-            result = pressed
-                ? GameplayKeyRecovery.ShouldRecoverPress(result, _textFieldActive, true,
+                return false;
+            return pressed
+                ? GameplayKeyRecovery.ShouldRecoverPress(false, _textFieldActive, true,
                     (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys)
-                : GameplayKeyRecovery.ShouldRecover(result, _textFieldActive, true,
+                : GameplayKeyRecovery.ShouldRecover(false, _textFieldActive, true,
                     (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys);
         }
 
