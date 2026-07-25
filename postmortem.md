@@ -18,7 +18,7 @@ Failed approaches:
 - consume rotation presses once from the vanilla `KeyBindingDef.KeyDownEvent` call sites
 - open map or world search from `PlaySettings.DoPlaySettingsGlobalControls` because vanilla additionally requires `Event.current.type == KeyDown`
 - poll native messages from the main-thread IMGUI pass without a native-to-managed callback
-- bound both native and managed queues, cap each IMGUI drain, and reset composition, engine, and recovered keys after queue loss
+- bound both native and managed queues, cap each IMGUI drain, and restart from a clean state after queue loss
 - stop and join the monitor thread before Unity tears down Mono
 - cap and buffer debug output, logging focused fields and searches only on key or text changes
 
