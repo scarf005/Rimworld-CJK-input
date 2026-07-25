@@ -12,11 +12,15 @@ Failed approaches:
 
 ## gameplay shortcut recovery
 
-- track accepted `WASD` presses from fcitx `ProcessKeyEvent` calls and expose their held state only outside text fields
-- latch `Q`, `E`, and `Z` presses until the next IMGUI pass because their Unity `KeyDown` events do not exist in Hangul mode
+- emit presses only after fcitx replies `accepted=true`, while every observed release clears recovered held state
+- cancel unresolved presses on release, focus loss, or input engine changes so late replies cannot recreate stale state
+- timestamp accepted presses at the native monitor and expire queued `Q`, `E`, and `Z` presses after 250 ms
 - consume rotation presses once from the vanilla `KeyBindingDef.KeyDownEvent` call sites
 - open map or world search from `PlaySettings.DoPlaySettingsGlobalControls` because vanilla additionally requires `Event.current.type == KeyDown`
-- clear unconsumed shortcut presses after each root IMGUI pass to prevent delayed activation
+- poll native messages from the main-thread IMGUI pass without a native-to-managed callback
+- bound both native and managed queues, cap each IMGUI drain, and reset composition, engine, and recovered keys after queue loss
+- stop and join the monitor thread before Unity tears down Mono
+- cap and buffer debug output, logging focused fields and searches only on key or text changes
 
 References:
 
