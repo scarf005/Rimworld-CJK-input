@@ -9,8 +9,8 @@
  * Queue messages:
  *   READY:<rimworld-pid>
  *   EVENT:<context-id>:<sequence>:ENGINE:<unique-name>
- *   EVENT:<context-id>:<sequence>:PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
- *   EVENT:<context-id>:<sequence>:COMMIT:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:PREEDIT|HANGUL_PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
+ *   EVENT:<context-id>:<sequence>:COMMIT|HANGUL_COMMIT:<UTF-8 hex>
  *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
  *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>:<monotonic ms>
  *   EVENT:<context-id>:<sequence>:KEYRESET:<reason>
@@ -89,6 +89,12 @@ static uint64_t next_sequence;
 static struct pending_key pending_keys[MAX_PENDING_KEYS];
 static size_t next_pending_key;
 
+static void mark_queue_desynced(void) {
+    pthread_mutex_lock(&queue_mutex);
+    atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
 static struct message_node *create_message_node(const char *text) {
     struct message_node *node = malloc(sizeof(*node));
     if (!node) return NULL;
@@ -113,24 +119,24 @@ static void enqueue_message(const char *format, ...) {
     va_end(args);
     if (length <= 0 || (size_t)length >= sizeof(buffer)) {
         if (!log_message)
-            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+            mark_queue_desynced();
         return;
     }
 
     struct message_node *node = create_message_node(buffer);
     if (!node) {
         if (!log_message)
-            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+            mark_queue_desynced();
         return;
     }
 
     pthread_mutex_lock(&queue_mutex);
     if (queue_count >= MAX_QUEUE_MESSAGES) {
+        if (!log_message)
+            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
         pthread_mutex_unlock(&queue_mutex);
         free(node->text);
         free(node);
-        if (!log_message)
-            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
         return;
     }
     if (queue_tail) queue_tail->next = node;
@@ -147,7 +153,7 @@ static void enqueue_hex(const char *prefix, const char *text) {
     const size_t length = prefix_length + 1 + text_length * 2;
     char *message = malloc(length + 1);
     if (!message) {
-        atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+        mark_queue_desynced();
         return;
     }
 
@@ -571,8 +577,9 @@ static void handle_message(DBusMessage *message) {
             enqueue_message("LOG:CommitString context=%u bytes=%zu text=%s",
                 context, strlen(text), text);
             char prefix[96];
-            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:COMMIT",
-                context, sequence);
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s",
+                context, sequence,
+                contexts[context - 1].hangul ? "HANGUL_COMMIT" : "COMMIT");
             enqueue_hex(prefix, text);
         }
     } else if (strcmp(member, "UpdateFormattedPreedit") == 0) {
@@ -582,8 +589,9 @@ static void handle_message(DBusMessage *message) {
             enqueue_message("LOG:Preedit context=%u cursor=%d bytes=%zu text=%s",
                 context, cursor, strlen(text), text);
             char prefix[96];
-            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:PREEDIT:%d",
-                context, sequence, cursor);
+            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s:%d",
+                context, sequence,
+                contexts[context - 1].hangul ? "HANGUL_PREEDIT" : "PREEDIT", cursor);
             enqueue_hex(prefix, text);
         } else {
             enqueue_message("ERROR:Preedit context=%u parse failed", context);

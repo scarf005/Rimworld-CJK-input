@@ -39,6 +39,8 @@ namespace FcitxCjkInput {
             new CommittedCharacterTracker();
         private static readonly GameplayKeyState GameplayKeys =
             new GameplayKeyState(Stopwatch.Frequency / 4L);
+        private static readonly ShortcutCommitGuard ShortcutCommits =
+            new ShortcutCommitGuard();
 
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
@@ -56,6 +58,9 @@ namespace FcitxCjkInput {
         private static long _restartAt;
         private static int _focusedControl;
         private static int _focusedTextFieldFrame = -10;
+        private static int _lastZContext;
+        private static int _unboundPreeditContext;
+        private static string _unboundPreedit = "";
         private static long _focusGeneration;
         private static bool _logInitialized;
         private static bool _textFieldActive;
@@ -272,6 +277,7 @@ namespace FcitxCjkInput {
                 WriteLog("RX " + line);
             if (line.StartsWith("READY:", StringComparison.Ordinal)) {
                 _nativeReady = true;
+                _restartAt = 0;
                 return;
             }
             if (line == "STOPPED") {
@@ -303,14 +309,22 @@ namespace FcitxCjkInput {
                 Composition.ResetAndDiscardActions();
                 CommittedCharacters.Clear();
                 GameplayKeys.Clear();
+                ClearShortcutComposition(0);
                 SetEngine("unknown");
+                _nativeStop?.Invoke();
+                StartNativeBridge();
                 return;
+            }
+            if (kind == "HANGUL_PREEDIT" || kind == "HANGUL_COMMIT") {
+                SetHangulEngine(contextId);
+                kind = kind == "HANGUL_PREEDIT" ? "PREEDIT" : "COMMIT";
             }
             if (kind == "ENGINE") {
                 Engines[contextId] = payload;
                 if (payload != "hangul") {
                     Composition.CancelComposition(contextId);
                     GameplayKeys.Clear();
+                    ClearShortcutComposition(contextId);
                 }
                 if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
                     SetEngine(payload);
@@ -322,6 +336,7 @@ namespace FcitxCjkInput {
                     SetEngine(Engines.TryGetValue(contextId, out var engine) ? engine : "unknown");
                 } else if (payload == "OUT") {
                     GameplayKeys.Clear();
+                    ClearShortcutComposition(contextId);
                     if (Composition.FocusOut(contextId, sequence))
                         SetEngine("unknown");
                 }
@@ -334,9 +349,9 @@ namespace FcitxCjkInput {
                 var keyValue = int.Parse(keyParts[0]);
                 var release = int.Parse(keyParts[1]) != 0;
                 var observedAt = long.Parse(keyParts[2]) * Stopwatch.Frequency / 1000L;
-                Engines[contextId] = "hangul";
-                if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
-                    SetEngine("hangul");
+                SetHangulEngine(contextId);
+                if (!release && (keyValue == 'z' || keyValue == 'Z'))
+                    _lastZContext = contextId;
                 var gameplayBlocked = _textFieldActive ||
                     Find.WindowStack.AnySearchWidgetFocused;
                 if (release || !gameplayBlocked)
@@ -345,6 +360,7 @@ namespace FcitxCjkInput {
             }
             if (kind == "KEYRESET") {
                 GameplayKeys.Clear();
+                ClearShortcutComposition(0);
                 return;
             }
             if (kind == "PREEDIT") {
@@ -356,21 +372,34 @@ namespace FcitxCjkInput {
                 var clampedCursorBytes = Math.Max(0, Math.Min(cursorBytes, bytes.Length));
                 var text = Encoding.UTF8.GetString(bytes);
                 var cursor = Encoding.UTF8.GetString(bytes, 0, clampedCursorBytes).Length;
+                if (text.Length == 0)
+                    ClearShortcutComposition(contextId);
                 if (Composition.Preedit(contextId, sequence, text, cursor)) {
+                    _unboundPreeditContext = 0;
+                    _unboundPreedit = "";
                     if (Engines.TryGetValue(contextId, out var engine))
                         SetEngine(engine);
                     if (DebugLogging)
                         WriteLog("STATE preedit context=" + contextId + " control=" +
                             _focusedControl + " cursorBytes=" + cursorBytes + " cursorChars=" +
                             cursor + " text=[" + Escape(text) + "]");
-                } else if (DebugLogging) {
-                    WriteLog("DROP preedit context=" + contextId + " sequence=" + sequence +
-                        " reason=inactive-or-unbound");
+                } else {
+                    _unboundPreeditContext = contextId;
+                    _unboundPreedit = text;
+                    if (DebugLogging)
+                        WriteLog("DROP preedit context=" + contextId + " sequence=" + sequence +
+                            " reason=inactive-or-unbound");
                 }
                 return;
             }
             if (kind == "COMMIT") {
                 var text = DecodeHex(payload);
+                if (ShortcutCommits.ShouldDiscard(contextId, text)) {
+                    if (DebugLogging)
+                        WriteLog("DROP shortcut commit context=" + contextId + " sequence=" +
+                            sequence + " text=[" + Escape(text) + "]");
+                    return;
+                }
                 Engines.TryGetValue(contextId, out var engine);
                 if (engine == "hangul" && ContainsNonAscii(text) &&
                     Composition.Commit(contextId, sequence, text, now)) {
@@ -384,6 +413,22 @@ namespace FcitxCjkInput {
                 return;
             }
             WriteLog("RX unknown event kind=" + kind + " payload=[" + Escape(payload) + "]");
+        }
+
+        private static void ClearShortcutComposition(int contextId) {
+            ShortcutCommits.Cancel(contextId);
+            if (contextId == 0 || _lastZContext == contextId)
+                _lastZContext = 0;
+            if (contextId == 0 || _unboundPreeditContext == contextId) {
+                _unboundPreeditContext = 0;
+                _unboundPreedit = "";
+            }
+        }
+
+        private static void SetHangulEngine(int contextId) {
+            Engines[contextId] = "hangul";
+            if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
+                SetEngine("hangul");
         }
 
         private static void SetEngine(string engine) {
@@ -509,6 +554,12 @@ namespace FcitxCjkInput {
         private static void AfterPlaySettingsControls(bool worldView) {
             if (!TryRecoverKeyBinding(KeyBindingDefOf.OpenMapSearch, pressed: true))
                 return;
+            if (_lastZContext != 0 && _unboundPreeditContext == _lastZContext &&
+                _unboundPreedit == "ㅋ") {
+                ShortcutCommits.Arm(_lastZContext, _unboundPreedit);
+                _unboundPreeditContext = 0;
+                _unboundPreedit = "";
+            }
             if (DebugLogging)
                 WriteLog("RECOVER binding=" + KeyBindingDefOf.OpenMapSearch.defName + " " +
                     DescribeEvent());

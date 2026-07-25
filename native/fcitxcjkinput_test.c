@@ -46,6 +46,18 @@ static void handle_reply(uint32_t serial, dbus_bool_t accepted,
     dbus_message_unref(message);
 }
 
+static void handle_commit(const char *text) {
+    DBusMessage *message = dbus_message_new_signal(
+        "/inputcontext_1", INPUT_CONTEXT_INTERFACE, "CommitString");
+    assert(message);
+    assert(dbus_message_set_destination(message, CLIENT));
+    assert(dbus_message_append_args(message,
+        DBUS_TYPE_STRING, &text,
+        DBUS_TYPE_INVALID));
+    handle_message(message);
+    dbus_message_unref(message);
+}
+
 static void expect_message(const char *expected) {
     char buffer[256];
     const int length = fcitx_bridge_poll(buffer, sizeof(buffer));
@@ -82,6 +94,8 @@ int main(void) {
     atomic_store_explicit(&debug_logging, 0, memory_order_relaxed);
     contexts[0].hangul = 1;
     snprintf(contexts[0].destination, sizeof(contexts[0].destination), "%s", CLIENT);
+    snprintf(contexts[0].path, sizeof(contexts[0].path), "%s", "/inputcontext_1");
+    context_count = 1;
     rimworld_destination_count = 1;
     snprintf(rimworld_destinations[0], sizeof(rimworld_destinations[0]), "%s", CLIENT);
 
@@ -142,5 +156,9 @@ int main(void) {
     expect_message("EVENT:0:0:RESET:queue-drop");
     expect_no_message();
 
+    contexts[0].hangul = 1;
+    next_sequence = 30;
+    handle_commit("가");
+    expect_message("EVENT:1:31:HANGUL_COMMIT:EAB080");
     return 0;
 }

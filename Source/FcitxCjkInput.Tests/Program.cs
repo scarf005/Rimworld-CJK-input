@@ -15,6 +15,7 @@ internal static class Program {
             MultipleCommittedCharactersAreSuppressedInOrder,
             DifferentCharacterIsNotSuppressedLater,
             CommittedCharacterSuppressionExpires,
+            RecoveredSearchShortcutDiscardsItsHangulCommit,
             HangulDirectionalKeysRecoverCameraInput,
             HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent,
             ShortcutPressesExpireInsteadOfFiringLater,
@@ -102,6 +103,19 @@ internal static class Program {
         tracker.Expect(target, "메", 1, 10);
 
         Equal(false, tracker.ShouldSuppress(target, '메', 12));
+    }
+
+    private static void RecoveredSearchShortcutDiscardsItsHangulCommit() {
+        var guard = new ShortcutCommitGuard();
+        guard.Arm(1, "ㅋ");
+
+        Equal(false, guard.ShouldDiscard(2, "ㅋ"));
+        Equal(true, guard.ShouldDiscard(1, "ㅋ"));
+        Equal(false, guard.ShouldDiscard(1, "ㅋ"));
+
+        guard.Arm(1, "ㅋ");
+        Equal(false, guard.ShouldDiscard(1, "카"));
+        Equal(false, guard.ShouldDiscard(1, "ㅋ"));
     }
 
     private static void HangulDirectionalKeysRecoverCameraInput() {

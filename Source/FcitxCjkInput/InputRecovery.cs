@@ -55,6 +55,34 @@ namespace FcitxCjkInput {
         }
     }
 
+    internal sealed class ShortcutCommitGuard {
+        private int _context;
+        private string _text = "";
+
+        public void Arm(int context, string text) {
+            _context = context;
+            _text = text;
+        }
+
+        public bool ShouldDiscard(int context, string text) {
+            if (_context != context)
+                return false;
+            var discard = _text == text;
+            Clear();
+            return discard;
+        }
+
+        public void Cancel(int context) {
+            if (context == 0 || _context == context)
+                Clear();
+        }
+
+        public void Clear() {
+            _context = 0;
+            _text = "";
+        }
+    }
+
     internal sealed class GameplayKeyState {
         private const int A = 1 << 0;
         private const int D = 1 << 1;
