@@ -7,7 +7,16 @@ Failed approaches:
 - Forwarding IMGUI keys to a separate IBus context split focus and Hangul state from Unity's SDL context; asynchronous consume/commit ordering produced raw-key leaks and duplicate or reordered text.
 - Polling `CurrentInputMethod`, kimpanel, and controller state did not reliably identify the focused context or physical 한/영 key transition.
 - Patching `Event.current`, `Input.inputString`, or `GUI.DoTextField` alone could not supply ordered fcitx `CommitString` messages; one attempted `DoTextField` return-value patch targeted a `void` method.
+- waiting for a Unity `KeyDown` before recovering gameplay shortcuts failed because fcitx accepts Hangul letter keys without forwarding any corresponding Unity key event
 - Unity cannot receive the compositor-consumed physical 한/영 key directly. The working path observes the fcitx signals already sent to Unity's SDL context, suppresses its raw Hangul keystrokes, and inserts only commits into the active IMGUI editor.
+
+## gameplay shortcut recovery
+
+- track accepted `WASD` presses from fcitx `ProcessKeyEvent` calls and expose their held state only outside text fields
+- latch `Q`, `E`, and `Z` presses until the next IMGUI pass because their Unity `KeyDown` events do not exist in Hangul mode
+- consume rotation presses once from the vanilla `KeyBindingDef.KeyDownEvent` call sites
+- open map or world search from `PlaySettings.DoPlaySettingsGlobalControls` because vanilla additionally requires `Event.current.type == KeyDown`
+- clear unconsumed shortcut presses after each root IMGUI pass to prevent delayed activation
 
 References:
 
