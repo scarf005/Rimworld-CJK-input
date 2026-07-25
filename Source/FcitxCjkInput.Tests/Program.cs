@@ -18,9 +18,11 @@ internal static class Program {
             HangulDirectionalKeysRecoverCameraInput,
             HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent,
             ShortcutPressesExpireInsteadOfFiringLater,
+            ShortcutPressQueueIsBounded,
             UnrelatedKeysAreNotRecovered,
             DirectionalKeysStayUnavailableInTextFields,
             ReleasedDirectionalKeysAreNotRecovered,
+            StaleDirectionalPressIsNotRecovered,
             ClearingDirectionalKeysPreventsStuckMovement,
             PreeditDisplayDoesNotChangeSavedText,
             EndNavigationIsPreservedAfterAnchoredCommit,
@@ -31,6 +33,7 @@ internal static class Program {
             OtherContextCannotJoinActiveComposition,
             ReplayedSequenceIsIgnored,
             ResetAcceptsRestartedSequence,
+            HardResetDiscardsPendingCommit,
             FocusOutClearsPreedit,
             EngineChangeCancelsPreedit,
             ExpiredCommitIsDiscarded
@@ -123,6 +126,11 @@ internal static class Program {
         Equal(true, keys.ConsumePress('e', 105));
         Equal(true, keys.ConsumePress('z', 105));
         Equal(false, keys.ConsumePress('z', 105));
+        keys.Update('q', false, 106);
+        keys.Update('q', false, 107);
+        Equal(true, keys.ConsumePress('q', 107));
+        Equal(true, keys.ConsumePress('q', 107));
+        Equal(false, keys.ConsumePress('q', 107));
     }
 
     private static void ShortcutPressesExpireInsteadOfFiringLater() {
@@ -135,6 +143,16 @@ internal static class Program {
         keys.Update('q', false, 300);
         keys.DiscardExpired(300 + Lifetime + 1);
         Equal(false, keys.ConsumePress('q', 300 + Lifetime + 1));
+    }
+
+    private static void ShortcutPressQueueIsBounded() {
+        var keys = new GameplayKeyState(Lifetime);
+        for (var i = 0; i < 9; i++)
+            keys.Update('z', false, 100 + i);
+
+        for (var i = 0; i < 8; i++)
+            Equal(true, keys.ConsumePress('z', 108));
+        Equal(false, keys.ConsumePress('z', 108));
     }
 
     private static void UnrelatedKeysAreNotRecovered() {
@@ -158,6 +176,13 @@ internal static class Program {
         keys.Update('d', true, 101);
 
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'd', 0, keys));
+    }
+
+    private static void StaleDirectionalPressIsNotRecovered() {
+        var keys = new GameplayKeyState(Lifetime);
+        keys.Update('w', false, 100, 100 + Lifetime + 1);
+
+        Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, true, 'w', 0, keys));
     }
 
     private static void ClearingDirectionalKeysPreventsStuckMovement() {
@@ -262,6 +287,16 @@ internal static class Program {
         Equal(2, actions.Count);
         Equal("가", actions[0].Text);
         Equal("나", actions[1].Text);
+    }
+
+    private static void HardResetDiscardsPendingCommit() {
+        var machine = CreateFocused(out var target, 0);
+        machine.Preedit(10, 1, "가", 1);
+        machine.Commit(10, 2, "가", 100);
+        machine.ResetAndDiscardActions();
+
+        Equal(0, machine.TakeActions(target, 100).Count);
+        Equal(0, machine.PendingCount);
     }
 
     private static void FocusOutClearsPreedit() {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace FcitxCjkInput {
     internal sealed class CommittedCharacterTracker {
@@ -62,18 +63,44 @@ namespace FcitxCjkInput {
         private const int Q = 1 << 4;
         private const int E = 1 << 5;
         private const int Z = 1 << 6;
+        private const int DirectionalMask = A | D | S | W;
+        private const int MaxPendingPressesPerKey = 8;
 
+        private readonly long _pressLifetime;
+        private readonly Queue<long> _qPresses = new Queue<long>();
+        private readonly Queue<long> _ePresses = new Queue<long>();
+        private readonly Queue<long> _zPresses = new Queue<long>();
         private int _down;
-        private int _pressed;
 
-        public void Update(int keyValue, bool release) {
+        public GameplayKeyState(long pressLifetime) {
+            _pressLifetime = pressLifetime;
+        }
+
+        public void Update(int keyValue, bool release, long observedAt) {
+            Update(keyValue, release, observedAt, observedAt);
+        }
+
+        public void Update(int keyValue, bool release, long observedAt, long now) {
             var mask = MaskFor(keyValue);
+            if (mask == 0)
+                return;
             if (release) {
                 _down &= ~mask;
-            } else {
-                _down |= mask;
-                _pressed |= mask;
+                return;
             }
+            if (now - observedAt > _pressLifetime)
+                return;
+            if ((mask & DirectionalMask) != 0) {
+                _down |= mask;
+                return;
+            }
+            var presses = QueueFor(mask);
+            if (presses == null)
+                return;
+            DiscardExpired(presses, now);
+            if (presses.Count >= MaxPendingPressesPerKey)
+                presses.Dequeue();
+            presses.Enqueue(observedAt);
         }
 
         public bool IsDown(int keyCode) {
@@ -81,21 +108,46 @@ namespace FcitxCjkInput {
             return mask != 0 && (_down & mask) != 0;
         }
 
-        public bool ConsumePress(int keyCode) {
-            var mask = MaskFor(keyCode);
-            if (mask == 0 || (_pressed & mask) == 0)
+        public bool ConsumePress(int keyCode, long now) {
+            var presses = QueueFor(MaskFor(keyCode));
+            if (presses == null)
                 return false;
-            _pressed &= ~mask;
+            DiscardExpired(presses, now);
+            if (presses.Count == 0)
+                return false;
+            presses.Dequeue();
             return true;
         }
 
-        public void ClearPressed() {
-            _pressed = 0;
+        public void DiscardExpired(long now) {
+            DiscardExpired(_qPresses, now);
+            DiscardExpired(_ePresses, now);
+            DiscardExpired(_zPresses, now);
         }
 
         public void Clear() {
             _down = 0;
-            _pressed = 0;
+            _qPresses.Clear();
+            _ePresses.Clear();
+            _zPresses.Clear();
+        }
+
+        private Queue<long> QueueFor(int mask) {
+            switch (mask) {
+                case Q:
+                    return _qPresses;
+                case E:
+                    return _ePresses;
+                case Z:
+                    return _zPresses;
+                default:
+                    return null;
+            }
+        }
+
+        private void DiscardExpired(Queue<long> presses, long now) {
+            while (presses.Count > 0 && now - presses.Peek() > _pressLifetime)
+                presses.Dequeue();
         }
 
         private static int MaskFor(int keyValue) {
@@ -135,9 +187,10 @@ namespace FcitxCjkInput {
         }
 
         public static bool ShouldRecoverPress(bool original, bool textFieldActive,
-            bool gameplayShortcut, int primaryKey, int secondaryKey, GameplayKeyState keys) {
+            bool gameplayShortcut, int primaryKey, int secondaryKey, GameplayKeyState keys,
+            long now) {
             return original || (!textFieldActive && gameplayShortcut &&
-                (keys.ConsumePress(primaryKey) || keys.ConsumePress(secondaryKey)));
+                (keys.ConsumePress(primaryKey, now) || keys.ConsumePress(secondaryKey, now)));
         }
     }
 }

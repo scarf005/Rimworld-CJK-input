@@ -142,6 +142,11 @@ namespace FcitxCjkInput {
             _activeContextLocked = false;
         }
 
+        public void ResetAndDiscardActions() {
+            Reset();
+            _actions.Clear();
+        }
+
         public void CancelComposition(int contextId) {
             if (_contexts.TryGetValue(contextId, out var context))
                 Clear(context);

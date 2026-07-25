@@ -19,7 +19,12 @@ namespace FcitxCjkInput {
         private const string LogPath = "/tmp/fcitxcjkinput.log";
         private const int RtldNow = 2;
         private const int NativeBufferSize = 16384;
+        private const int NativeDrainLimit = 32;
         private const int NativeRestartDelayMs = 2000;
+        private const int LogBufferSize = 65536;
+        private const long LogMaxBytes = 8L * 1024 * 1024;
+
+        private static readonly long LogFlushInterval = Stopwatch.Frequency / 4L;
 
         private static readonly object LogLock = new object();
         private static readonly byte[] NativeBuffer = new byte[NativeBufferSize];
@@ -32,40 +37,32 @@ namespace FcitxCjkInput {
             new CompositionStateMachine(Stopwatch.Frequency * 2L);
         private static readonly CommittedCharacterTracker CommittedCharacters =
             new CommittedCharacterTracker();
-        private static readonly GameplayKeyState GameplayKeys = new GameplayKeyState();
-        private static readonly NativeNotify NotifyCallback = OnNativeNotify;
-        private static readonly SendOrPostCallback DrainCallback = _ => DrainNativeMessages();
-        private static readonly SendOrPostCallback RestartCallback = _ => RestartNativeBridgeOnMainThread();
+        private static readonly GameplayKeyState GameplayKeys =
+            new GameplayKeyState(Stopwatch.Frequency / 4L);
 
         private static StreamWriter _log;
         private static IntPtr _nativeHandle;
-        private static NativeSetNotify _nativeSetNotify;
         private static NativeSetDebug _nativeSetDebug;
         private static NativeStart _nativeStart;
         private static NativePoll _nativePoll;
-        private static SynchronizationContext _mainContext;
-        private static System.Threading.Timer _restartTimer;
+        private static NativeStop _nativeStop;
         private static string _engine = "unknown";
         private static bool _nativeReady;
         private static bool _overlay;
         private static int _overlayFrame = -1;
         private static bool _nativeLoaded;
         private static int _mainThreadId;
-        private static int _nativeDrainRequested;
-        private static int _fallbackRestartRequested;
+        private static int _nativePollFrame = -1;
+        private static long _restartAt;
         private static int _focusedControl;
         private static int _focusedTextFieldFrame = -10;
         private static long _focusGeneration;
         private static bool _logInitialized;
         private static bool _textFieldActive;
+        private static int _shuttingDown;
+        private static long _lastLogFlush;
 
         private static bool DebugLogging => FcitxCjkInputEntry.Settings?.DebugLog == true;
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void NativeNotify(IntPtr userData);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void NativeSetNotify(NativeNotify callback, IntPtr userData);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void NativeSetDebug(int enabled);
@@ -75,6 +72,9 @@ namespace FcitxCjkInput {
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int NativePoll([Out] byte[] buffer, int capacity);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void NativeStop();
 
         [DllImport("libdl.so.2")]
         private static extern IntPtr dlopen(string fileName, int flags);
@@ -91,11 +91,10 @@ namespace FcitxCjkInput {
 
             try {
                 _mainThreadId = Thread.CurrentThread.ManagedThreadId;
-                _mainContext = SynchronizationContext.Current;
                 EnsureLog();
                 WriteRuntimeHeader("INIT");
                 LoadNativeBridge();
-                _nativeSetNotify(NotifyCallback, IntPtr.Zero);
+                Application.quitting += Shutdown;
                 _nativeSetDebug(DebugLogging ? 1 : 0);
                 Patch();
                 StartNativeBridge();
@@ -103,11 +102,14 @@ namespace FcitxCjkInput {
                     (DebugLogging ? "log=" + LogPath : "debug log disabled"));
             } catch (Exception exception) {
                 WriteLog("FATAL " + exception);
+                Shutdown();
                 Log.Error("[CJK] initialization failed: " + exception);
             }
         }
 
         internal static void SetDebugLogging(bool enabled) {
+            if (Volatile.Read(ref _shuttingDown) != 0)
+                return;
             if (enabled)
                 EnsureLog();
             if (_nativeSetDebug != null)
@@ -129,8 +131,7 @@ namespace FcitxCjkInput {
             WriteLog(reason + " unity=" + Application.unityVersion + " pid=" +
                 Process.GetCurrentProcess().Id + " XMODIFIERS=" +
                 Environment.GetEnvironmentVariable("XMODIFIERS") + " SDL_IM_MODULE=" +
-                Environment.GetEnvironmentVariable("SDL_IM_MODULE") + " syncContext=" +
-                (_mainContext?.GetType().FullName ?? "null") + " engine=" + _engine +
+                Environment.GetEnvironmentVariable("SDL_IM_MODULE") + " engine=" + _engine +
                 " native=" + _nativeReady + " ime=" + Input.imeCompositionMode);
         }
 
@@ -164,8 +165,7 @@ namespace FcitxCjkInput {
                     "RimWorld.PlaySettings.DoPlaySettingsGlobalControls");
 
             harmony.Patch(rootOnGui,
-                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)),
-                postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterRootOnGui)));
+                prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeRootOnGui)));
             harmony.Patch(desktopTextField,
                 prefix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(BeforeDesktopTextField)),
                 postfix: new HarmonyMethod(typeof(FcitxCjkInputMod), nameof(AfterDesktopTextField)));
@@ -199,10 +199,10 @@ namespace FcitxCjkInput {
             if (_nativeHandle == IntPtr.Zero)
                 throw new DllNotFoundException(path + ": " + GetDlError());
 
-            _nativeSetNotify = LoadNativeFunction<NativeSetNotify>("fcitx_bridge_set_notify");
             _nativeSetDebug = LoadNativeFunction<NativeSetDebug>("fcitx_bridge_set_debug");
             _nativeStart = LoadNativeFunction<NativeStart>("fcitx_bridge_start");
             _nativePoll = LoadNativeFunction<NativePoll>("fcitx_bridge_poll");
+            _nativeStop = LoadNativeFunction<NativeStop>("fcitx_bridge_stop");
             _nativeLoaded = true;
             WriteLog("NATIVE loaded path=" + path);
         }
@@ -220,8 +220,9 @@ namespace FcitxCjkInput {
         }
 
         private static void StartNativeBridge() {
-            _restartTimer?.Dispose();
-            _restartTimer = null;
+            if (Volatile.Read(ref _shuttingDown) != 0)
+                return;
+            _restartAt = 0;
             _nativeReady = false;
             var result = _nativeStart((uint)Process.GetCurrentProcess().Id);
             WriteLog("NATIVE start result=" + result);
@@ -229,45 +230,22 @@ namespace FcitxCjkInput {
                 ScheduleNativeRestart();
         }
 
-        private static void RestartNativeBridgeOnMainThread() {
-            if (Thread.CurrentThread.ManagedThreadId == _mainThreadId)
-                StartNativeBridge();
-            else
-                Interlocked.Exchange(ref _fallbackRestartRequested, 1);
-        }
-
         private static void ScheduleNativeRestart() {
-            _restartTimer?.Dispose();
-            _restartTimer = new System.Threading.Timer(_ => {
-                if (_mainContext != null)
-                    _mainContext.Post(RestartCallback, null);
-                else
-                    Interlocked.Exchange(ref _fallbackRestartRequested, 1);
-            }, null, NativeRestartDelayMs, Timeout.Infinite);
-        }
-
-        private static void OnNativeNotify(IntPtr userData) {
-            Interlocked.Exchange(ref _nativeDrainRequested, 1);
-            try {
-                if (_mainContext != null) {
-                    _mainContext.Post(DrainCallback, null);
-                    return;
-                }
-            } catch (Exception exception) {
-                WriteLog("NATIVE notify fallback error=" + exception);
-            }
+            if (Volatile.Read(ref _shuttingDown) != 0)
+                return;
+            _restartAt = Stopwatch.GetTimestamp() +
+                Stopwatch.Frequency * NativeRestartDelayMs / 1000L;
         }
 
         private static void DrainNativeMessages() {
-            if (Thread.CurrentThread.ManagedThreadId != _mainThreadId) {
-                Interlocked.Exchange(ref _nativeDrainRequested, 1);
+            if (Volatile.Read(ref _shuttingDown) != 0)
                 return;
-            }
-            Interlocked.Exchange(ref _nativeDrainRequested, 0);
+            if (Thread.CurrentThread.ManagedThreadId != _mainThreadId)
+                return;
             if (!_nativeLoaded)
                 return;
 
-            while (true) {
+            for (var count = 0; count < NativeDrainLimit; count++) {
                 var length = _nativePoll(NativeBuffer, NativeBuffer.Length);
                 if (length <= 0)
                     break;
@@ -320,6 +298,14 @@ namespace FcitxCjkInput {
 
         private static void HandleContextEvent(int contextId, long sequence, string kind, string payload) {
             var now = Stopwatch.GetTimestamp();
+            if (kind == "RESET") {
+                Engines.Clear();
+                Composition.ResetAndDiscardActions();
+                CommittedCharacters.Clear();
+                GameplayKeys.Clear();
+                SetEngine("unknown");
+                return;
+            }
             if (kind == "ENGINE") {
                 Engines[contextId] = payload;
                 if (payload != "hangul") {
@@ -342,12 +328,23 @@ namespace FcitxCjkInput {
                 return;
             }
             if (kind == "KEY") {
-                var separator = payload.IndexOf(':');
-                if (separator < 0)
-                    throw new FormatException("Missing key release separator: " + payload);
-                var keyValue = int.Parse(payload.Substring(0, separator));
-                var release = int.Parse(payload.Substring(separator + 1)) != 0;
-                GameplayKeys.Update(keyValue, release);
+                var keyParts = payload.Split(':');
+                if (keyParts.Length != 3)
+                    throw new FormatException("Invalid key event: " + payload);
+                var keyValue = int.Parse(keyParts[0]);
+                var release = int.Parse(keyParts[1]) != 0;
+                var observedAt = long.Parse(keyParts[2]) * Stopwatch.Frequency / 1000L;
+                Engines[contextId] = "hangul";
+                if (Composition.ActiveContext == 0 || Composition.ActiveContext == contextId)
+                    SetEngine("hangul");
+                var gameplayBlocked = _textFieldActive ||
+                    Find.WindowStack.AnySearchWidgetFocused;
+                if (release || !gameplayBlocked)
+                    GameplayKeys.Update(keyValue, release, observedAt, now);
+                return;
+            }
+            if (kind == "KEYRESET") {
+                GameplayKeys.Clear();
                 return;
             }
             if (kind == "PREEDIT") {
@@ -396,11 +393,11 @@ namespace FcitxCjkInput {
         }
 
         private static void BeforeRootOnGui() {
-            if (Interlocked.Exchange(ref _nativeDrainRequested, 0) != 0)
-                DrainNativeMessages();
-            if (Interlocked.Exchange(ref _fallbackRestartRequested, 0) != 0)
+            var now = Stopwatch.GetTimestamp();
+            if (_restartAt != 0 && now >= _restartAt)
                 StartNativeBridge();
-            Composition.DiscardExpired(Stopwatch.GetTimestamp());
+            Composition.DiscardExpired(now);
+            GameplayKeys.DiscardExpired(now);
             if (GUIUtility.keyboardControl == 0 && _focusedControl != 0) {
                 _focusedControl = 0;
                 Composition.Blur();
@@ -408,6 +405,10 @@ namespace FcitxCjkInput {
             var textFieldActive = ImeRouting.TextFieldIsActive(GUIUtility.keyboardControl,
                 _focusedControl, _focusedTextFieldFrame, Time.frameCount);
             _textFieldActive = textFieldActive;
+            if (_nativePollFrame != Time.frameCount) {
+                _nativePollFrame = Time.frameCount;
+                DrainNativeMessages();
+            }
             SetImeCompositionMode(textFieldActive, "root");
 
             var currentEvent = Event.current;
@@ -421,10 +422,6 @@ namespace FcitxCjkInput {
                 currentEvent.Use();
                 return;
             }
-        }
-
-        private static void AfterRootOnGui() {
-            GameplayKeys.ClearPressed();
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
@@ -475,19 +472,20 @@ namespace FcitxCjkInput {
 
         private static void BeforeQuickSearch(QuickSearchWidget __instance, out string __state) {
             __state = __instance.filter.Text;
-            if (!DebugLogging)
-                return;
-            WriteLog("SEARCH before filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
-                " text=[" + Escape(__state) + "] focused=" + __instance.CurrentlyFocused() + " " +
-                DescribeEvent());
         }
 
         private static void AfterQuickSearch(QuickSearchWidget __instance, string __state) {
             if (!DebugLogging)
                 return;
-            WriteLog("SEARCH after filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
+            var focused = __instance.CurrentlyFocused();
+            var currentEvent = Event.current;
+            var keyEvent = currentEvent != null && (currentEvent.rawType == EventType.KeyDown ||
+                currentEvent.rawType == EventType.KeyUp);
+            if (__state == __instance.filter.Text && (!focused || !keyEvent))
+                return;
+            WriteLog("SEARCH filter=" + RuntimeHelpers.GetHashCode(__instance.filter) +
                 " before=[" + Escape(__state) + "] after=[" + Escape(__instance.filter.Text) +
-                "] focused=" + __instance.CurrentlyFocused() + " " + DescribeEvent());
+                "] focused=" + focused + " " + DescribeEvent());
         }
 
         private static void BeforeSearchTextSet(QuickSearchFilter __instance, string value) {
@@ -525,7 +523,7 @@ namespace FcitxCjkInput {
             if (result || !gameplayShortcut)
                 return;
             result = TryRecoverKeyBinding(bindingDef, pressed);
-            if (result && DebugLogging)
+            if (result && pressed && DebugLogging)
                 WriteLog("RECOVER binding=" + bindingDef.defName + " " + DescribeEvent());
         }
 
@@ -537,7 +535,8 @@ namespace FcitxCjkInput {
                 return false;
             return pressed
                 ? GameplayKeyRecovery.ShouldRecoverPress(false, _textFieldActive, true,
-                    (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys)
+                    (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys,
+                    Stopwatch.GetTimestamp())
                 : GameplayKeyRecovery.ShouldRecover(false, _textFieldActive, true,
                     (int)binding.keyBindingA, (int)binding.keyBindingB, GameplayKeys);
         }
@@ -609,7 +608,10 @@ namespace FcitxCjkInput {
 
         private static void LogTextField(string stage, ControlToken target, int id, GUIContent content,
             TextEditor editor) {
-            if (!DebugLogging || (GUIUtility.keyboardControl != id && target.Id == 0))
+            var currentEvent = Event.current;
+            if (!DebugLogging || GUIUtility.keyboardControl != id || currentEvent == null ||
+                (currentEvent.rawType != EventType.KeyDown &&
+                    currentEvent.rawType != EventType.KeyUp))
                 return;
             WriteLog(stage + " control=" + id + " token=" + target.Id + ":" + target.Generation +
                 " keyboardControl=" + GUIUtility.keyboardControl + " hotControl=" +
@@ -768,12 +770,26 @@ namespace FcitxCjkInput {
             return text.Replace("\\", "\\\\").Replace("\r", "\\r").Replace("\n", "\\n");
         }
 
+        private static void Shutdown() {
+            if (Interlocked.Exchange(ref _shuttingDown, 1) != 0)
+                return;
+            Application.quitting -= Shutdown;
+            _restartAt = 0;
+            _nativeStop?.Invoke();
+            _nativeLoaded = false;
+            lock (LogLock) {
+                _log?.Dispose();
+                _log = null;
+            }
+        }
+
         private static void EnsureLog() {
             if (!DebugLogging || _log != null)
                 return;
-            _log = new StreamWriter(LogPath, _logInitialized, new UTF8Encoding(false)) {
-                AutoFlush = true
-            };
+            var append = _logInitialized && (!File.Exists(LogPath) ||
+                new FileInfo(LogPath).Length < LogMaxBytes);
+            _log = new StreamWriter(LogPath, append, new UTF8Encoding(false), LogBufferSize);
+            _lastLogFlush = Stopwatch.GetTimestamp();
             _logInitialized = true;
         }
 
@@ -782,7 +798,19 @@ namespace FcitxCjkInput {
                 return;
             lock (LogLock) {
                 EnsureLog();
-                _log?.WriteLine(DateTimeOffset.Now.ToString("O") + " " + message);
+                if (_log == null)
+                    return;
+                _log.WriteLine(DateTimeOffset.Now.ToString("O") + " " + message);
+                var now = Stopwatch.GetTimestamp();
+                if (now - _lastLogFlush < LogFlushInterval)
+                    return;
+                _log.Flush();
+                _lastLogFlush = now;
+                if (_log.BaseStream.Position < LogMaxBytes)
+                    return;
+                _log.Dispose();
+                _log = new StreamWriter(LogPath, false, new UTF8Encoding(false), LogBufferSize);
+                _log.WriteLine(DateTimeOffset.Now.ToString("O") + " LOG rotated");
             }
         }
     }

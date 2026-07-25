@@ -2,7 +2,6 @@
  * Native fcitx5 signal bridge loaded in-process by FcitxCjkInput.dll.
  *
  * Public API:
- *   void fcitx_bridge_set_notify(void (*callback)(void *), void *user_data)
  *   int fcitx_bridge_start(uint32_t rimworld_pid)
  *   int fcitx_bridge_poll(char *buffer, int capacity)
  *   void fcitx_bridge_stop(void)
@@ -13,7 +12,9 @@
  *   EVENT:<context-id>:<sequence>:PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
  *   EVENT:<context-id>:<sequence>:COMMIT:<UTF-8 hex>
  *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
- *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>
+ *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>:<monotonic ms>
+ *   EVENT:<context-id>:<sequence>:KEYRESET:<reason>
+ *   EVENT:0:0:RESET:<reason>
  *   STOPPED
  *   LOG:<diagnostic>
  *   ERROR:<diagnostic>
@@ -29,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define EXPORT __attribute__((visibility("default")))
@@ -38,6 +40,7 @@
 #define MAX_DESTINATIONS 16
 #define MAX_CONTEXTS 64
 #define MAX_PENDING_KEYS 128
+#define MAX_QUEUE_MESSAGES 512
 
 struct context_entry {
     char destination[128];
@@ -53,9 +56,10 @@ struct pending_key {
     uint32_t keycode;
     uint32_t state;
     dbus_bool_t release;
+    uint64_t observed_at_ms;
+    int recover;
+    int canceled;
 };
-
-typedef void (*notify_callback)(void *user_data);
 
 struct message_node {
     char *text;
@@ -66,15 +70,15 @@ static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct message_node *queue_head;
 static struct message_node *queue_tail;
+static size_t queue_count;
 static pthread_t worker_thread;
 static int worker_created;
 static int dbus_threads_ready;
 static atomic_int running;
 static atomic_int debug_logging;
 static atomic_int restart_requested;
+static atomic_int queue_desynced;
 static uint32_t rimworld_pid;
-static notify_callback queue_notify;
-static void *queue_notify_data;
 
 static DBusConnection *connection;
 static char rimworld_destinations[MAX_DESTINATIONS][128];
@@ -85,34 +89,55 @@ static uint64_t next_sequence;
 static struct pending_key pending_keys[MAX_PENDING_KEYS];
 static size_t next_pending_key;
 
+static struct message_node *create_message_node(const char *text) {
+    struct message_node *node = malloc(sizeof(*node));
+    if (!node) return NULL;
+    node->text = strdup(text);
+    if (!node->text) {
+        free(node);
+        return NULL;
+    }
+    node->next = NULL;
+    return node;
+}
+
 static void enqueue_message(const char *format, ...) {
-    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) &&
-        strncmp(format, "LOG:", 4) == 0) return;
+    const int log_message = strncmp(format, "LOG:", 4) == 0;
+    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) && log_message)
+        return;
 
     char buffer[MAX_MESSAGE];
     va_list args;
     va_start(args, format);
     const int length = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
-    if (length <= 0 || (size_t)length >= sizeof(buffer)) return;
-
-    struct message_node *node = malloc(sizeof(*node));
-    if (!node) return;
-    node->text = strdup(buffer);
-    if (!node->text) {
-        free(node);
+    if (length <= 0 || (size_t)length >= sizeof(buffer)) {
+        if (!log_message)
+            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
         return;
     }
-    node->next = NULL;
+
+    struct message_node *node = create_message_node(buffer);
+    if (!node) {
+        if (!log_message)
+            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+        return;
+    }
 
     pthread_mutex_lock(&queue_mutex);
-    const int notify = queue_head == NULL;
+    if (queue_count >= MAX_QUEUE_MESSAGES) {
+        pthread_mutex_unlock(&queue_mutex);
+        free(node->text);
+        free(node);
+        if (!log_message)
+            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+        return;
+    }
     if (queue_tail) queue_tail->next = node;
     else queue_head = node;
     queue_tail = node;
+    queue_count++;
     pthread_mutex_unlock(&queue_mutex);
-
-    if (notify && queue_notify) queue_notify(queue_notify_data);
 }
 
 static void enqueue_hex(const char *prefix, const char *text) {
@@ -121,7 +146,10 @@ static void enqueue_hex(const char *prefix, const char *text) {
     const size_t text_length = strlen(text);
     const size_t length = prefix_length + 1 + text_length * 2;
     char *message = malloc(length + 1);
-    if (!message) return;
+    if (!message) {
+        atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+        return;
+    }
 
     memcpy(message, prefix, prefix_length);
     message[prefix_length] = ':';
@@ -235,16 +263,14 @@ static int become_monitor(void) {
             rimworld_destinations[i]);
         rule = rule_buffer;
         dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        if (atomic_load_explicit(&debug_logging, memory_order_relaxed)) {
-            snprintf(rule_buffer, sizeof(rule_buffer),
-                "type='method_return',destination='%.127s'", rimworld_destinations[i]);
-            rule = rule_buffer;
-            dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-            snprintf(rule_buffer, sizeof(rule_buffer),
-                "type='error',destination='%.127s'", rimworld_destinations[i]);
-            rule = rule_buffer;
-            dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        }
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='method_return',destination='%.127s'", rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+        snprintf(rule_buffer, sizeof(rule_buffer),
+            "type='error',destination='%.127s'", rimworld_destinations[i]);
+        rule = rule_buffer;
+        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
     }
     dbus_message_iter_close_container(&root, &rules);
     uint32_t flags = 0;
@@ -353,11 +379,54 @@ static int read_preedit(DBusMessage *message, char *buffer, size_t size,
     return 1;
 }
 
+static uint64_t monotonic_millis(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
 static int is_recoverable_key(uint32_t keyval) {
     return keyval == 'a' || keyval == 'A' || keyval == 'd' || keyval == 'D' ||
         keyval == 's' || keyval == 'S' || keyval == 'w' || keyval == 'W' ||
         keyval == 'q' || keyval == 'Q' || keyval == 'e' || keyval == 'E' ||
         keyval == 'z' || keyval == 'Z';
+}
+
+static struct pending_key *find_pending_key(const char *client, uint32_t serial) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial == serial &&
+            strcmp(pending_keys[i].client, client) == 0)
+            return &pending_keys[i];
+    }
+    return NULL;
+}
+
+static void cancel_pending_key(uint32_t context, uint32_t keycode) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial != 0 && pending_keys[i].recover &&
+            pending_keys[i].context == context && pending_keys[i].keycode == keycode)
+            pending_keys[i].canceled = 1;
+    }
+}
+
+static void cancel_pending_context(uint32_t context) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        if (pending_keys[i].serial != 0 && pending_keys[i].context == context)
+            pending_keys[i].canceled = 1;
+    }
+}
+
+static struct pending_key *reserve_pending_key(uint32_t context,
+    unsigned long long sequence) {
+    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
+        struct pending_key *pending =
+            &pending_keys[next_pending_key++ % MAX_PENDING_KEYS];
+        if (pending->serial == 0) return pending;
+    }
+    memset(pending_keys, 0, sizeof(pending_keys));
+    next_pending_key = 0;
+    enqueue_message("EVENT:%u:%llu:KEYRESET:pending-overflow", context, sequence);
+    return &pending_keys[next_pending_key++];
 }
 
 static void handle_process_key(DBusMessage *message, uint32_t context,
@@ -381,45 +450,49 @@ static void handle_process_key(DBusMessage *message, uint32_t context,
         dbus_error_free(&error);
         return;
     }
-    if (contexts[context - 1].hangul && is_recoverable_key(keyval))
-        enqueue_message("EVENT:%u:%llu:KEY:%u:%d", context, sequence, keyval, release);
+    const uint64_t observed_at_ms = monotonic_millis();
+    const int recoverable = contexts[context - 1].hangul &&
+        is_recoverable_key(keyval);
+    if (recoverable && release) {
+        cancel_pending_key(context, keycode);
+        enqueue_message("EVENT:%u:%llu:KEY:%u:1:%llu", context, sequence, keyval,
+            (unsigned long long)observed_at_ms);
+    }
 
-    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed)) return;
-
+    const int debug = atomic_load_explicit(&debug_logging, memory_order_relaxed);
+    const int recover = recoverable && !release;
     const uint32_t serial = dbus_message_get_serial(message);
-    struct pending_key *pending = &pending_keys[next_pending_key++ % MAX_PENDING_KEYS];
-    snprintf(pending->client, sizeof(pending->client), "%s", client_name(message));
-    pending->serial = serial;
-    pending->context = context;
-    pending->keyval = keyval;
-    pending->keycode = keycode;
-    pending->state = state;
-    pending->release = release;
-    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u hangul=%d",
+    if (debug || recover) {
+        struct pending_key *pending = reserve_pending_key(context, sequence);
+        snprintf(pending->client, sizeof(pending->client), "%s", client_name(message));
+        pending->serial = serial;
+        pending->context = context;
+        pending->keyval = keyval;
+        pending->keycode = keycode;
+        pending->state = state;
+        pending->release = release;
+        pending->observed_at_ms = observed_at_ms;
+        pending->recover = recover;
+        pending->canceled = 0;
+    }
+    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u hangul=%d recover=%d",
         serial, context, keyval, keycode, state, release, time,
-        contexts[context - 1].hangul);
+        contexts[context - 1].hangul, recover);
 }
 
-static void log_process_key_reply(DBusMessage *message) {
-    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) ||
-        !is_rimworld_destination(dbus_message_get_destination(message)))
-        return;
+static void handle_process_key_reply(DBusMessage *message,
+    unsigned long long sequence) {
+    if (!is_rimworld_destination(dbus_message_get_destination(message))) return;
     const char *client = dbus_message_get_destination(message);
     const uint32_t reply_serial = dbus_message_get_reply_serial(message);
-    struct pending_key *pending = NULL;
-    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
-        if (pending_keys[i].serial == reply_serial &&
-            strcmp(pending_keys[i].client, client) == 0) {
-            pending = &pending_keys[i];
-            break;
-        }
-    }
+    struct pending_key *pending = find_pending_key(client, reply_serial);
     if (!pending) return;
 
     if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_ERROR) {
-        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u release=%d error=%s",
+        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u release=%d recover=%d canceled=%d error=%s",
             reply_serial, pending->context, pending->keyval, pending->keycode,
-            pending->release, dbus_message_get_error_name(message));
+            pending->release, pending->recover, pending->canceled,
+            dbus_message_get_error_name(message));
         pending->serial = 0;
         return;
     }
@@ -429,9 +502,13 @@ static void log_process_key_reply(DBusMessage *message) {
     dbus_bool_t accepted = FALSE;
     if (dbus_message_get_args(message, &error, DBUS_TYPE_BOOLEAN, &accepted,
             DBUS_TYPE_INVALID)) {
-        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u state=%u release=%d accepted=%d",
+        if (pending->recover && !pending->canceled && accepted)
+            enqueue_message("EVENT:%u:%llu:KEY:%u:0:%llu", pending->context, sequence,
+                pending->keyval, (unsigned long long)pending->observed_at_ms);
+        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u state=%u release=%d accepted=%d recover=%d canceled=%d",
             reply_serial, pending->context, pending->keyval, pending->keycode,
-            pending->state, pending->release, accepted);
+            pending->state, pending->release, accepted, pending->recover,
+            pending->canceled);
     } else {
         enqueue_message("ERROR:ProcessKeyReply serial=%u context=%u error=%s",
             reply_serial, pending->context,
@@ -444,7 +521,7 @@ static void log_process_key_reply(DBusMessage *message) {
 static void handle_message(DBusMessage *message) {
     const int type = dbus_message_get_type(message);
     if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
-        log_process_key_reply(message);
+        handle_process_key_reply(message, ++next_sequence);
         return;
     }
     if (!dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
@@ -477,6 +554,8 @@ static void handle_message(DBusMessage *message) {
                 DBUS_TYPE_STRING, &unique_name,
                 DBUS_TYPE_STRING, &language,
                 DBUS_TYPE_INVALID)) {
+            if (strcmp(unique_name, "hangul") != 0)
+                cancel_pending_context(context);
             contexts[context - 1].hangul = strcmp(unique_name, "hangul") == 0;
             enqueue_message("LOG:CurrentIM context=%u name=%s unique=%s lang=%s",
                 context, name, unique_name, language);
@@ -510,6 +589,7 @@ static void handle_message(DBusMessage *message) {
             enqueue_message("ERROR:Preedit context=%u parse failed", context);
         }
     } else if (strcmp(member, "NotifyFocusOut") == 0) {
+        cancel_pending_context(context);
         enqueue_message("LOG:NotifyFocusOut context=%u", context);
         enqueue_message("EVENT:%u:%llu:FOCUS:OUT", context, sequence);
     }
@@ -561,11 +641,6 @@ stopped:
     return NULL;
 }
 
-EXPORT void fcitx_bridge_set_notify(notify_callback callback, void *user_data) {
-    queue_notify = callback;
-    queue_notify_data = user_data;
-}
-
 EXPORT void fcitx_bridge_set_debug(int enabled) {
     const int changed = atomic_exchange_explicit(&debug_logging, enabled != 0,
         memory_order_relaxed) != (enabled != 0);
@@ -612,6 +687,26 @@ EXPORT int fcitx_bridge_poll(char *buffer, int capacity) {
     if (!buffer || capacity <= 1) return -1;
 
     pthread_mutex_lock(&queue_mutex);
+    if (atomic_exchange_explicit(&queue_desynced, 0, memory_order_relaxed)) {
+        struct message_node *discarded = queue_head;
+        queue_head = NULL;
+        queue_tail = NULL;
+        queue_count = 0;
+        pthread_mutex_unlock(&queue_mutex);
+        while (discarded) {
+            struct message_node *next = discarded->next;
+            free(discarded->text);
+            free(discarded);
+            discarded = next;
+        }
+        const char reset[] = "EVENT:0:0:RESET:queue-drop";
+        const size_t reset_length = sizeof(reset) - 1;
+        const size_t copy_length = reset_length < (size_t)(capacity - 1)
+            ? reset_length : (size_t)(capacity - 1);
+        memcpy(buffer, reset, copy_length);
+        buffer[copy_length] = '\0';
+        return (int)copy_length;
+    }
     struct message_node *node = queue_head;
     if (!node) {
         pthread_mutex_unlock(&queue_mutex);
@@ -619,6 +714,7 @@ EXPORT int fcitx_bridge_poll(char *buffer, int capacity) {
     }
     queue_head = node->next;
     if (!queue_head) queue_tail = NULL;
+    queue_count--;
     pthread_mutex_unlock(&queue_mutex);
 
     const size_t length = strlen(node->text);
@@ -643,4 +739,9 @@ EXPORT void fcitx_bridge_stop(void) {
         worker_created = 0;
     }
     pthread_mutex_unlock(&state_mutex);
+}
+
+__attribute__((destructor))
+static void stop_bridge_on_unload(void) {
+    fcitx_bridge_stop();
 }

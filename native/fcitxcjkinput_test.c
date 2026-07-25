@@ -53,6 +53,26 @@ static void expect_message(const char *expected) {
     assert(strcmp(buffer, expected) == 0);
 }
 
+static void expect_key_message(uint32_t expected_context,
+    unsigned long long expected_sequence, uint32_t expected_keyval,
+    int expected_release) {
+    char buffer[256];
+    const int length = fcitx_bridge_poll(buffer, sizeof(buffer));
+    assert(length > 0);
+    uint32_t context = 0;
+    unsigned long long sequence = 0;
+    uint32_t keyval = 0;
+    int release = 0;
+    unsigned long long observed_at_ms = 0;
+    assert(sscanf(buffer, "EVENT:%u:%llu:KEY:%u:%d:%llu", &context, &sequence,
+        &keyval, &release, &observed_at_ms) == 5);
+    assert(context == expected_context);
+    assert(sequence == expected_sequence);
+    assert(keyval == expected_keyval);
+    assert(release == expected_release);
+    assert(observed_at_ms > 0);
+}
+
 static void expect_no_message(void) {
     char buffer[256];
     assert(fcitx_bridge_poll(buffer, sizeof(buffer)) == 0);
@@ -68,14 +88,14 @@ int main(void) {
     handle_key('w', FALSE, 7, 7);
     expect_no_message();
     handle_reply(7, TRUE, 8);
-    expect_message("EVENT:1:8:KEY:119:0");
+    expect_key_message(1, 8, 'w', 0);
     handle_key('w', TRUE, 9, 9);
-    expect_message("EVENT:1:9:KEY:119:1");
+    expect_key_message(1, 9, 'w', 1);
 
     handle_key('q', FALSE, 10, 10);
     expect_no_message();
     handle_reply(10, TRUE, 11);
-    expect_message("EVENT:1:11:KEY:113:0");
+    expect_key_message(1, 11, 'q', 0);
 
     handle_key('e', FALSE, 12, 12);
     handle_reply(12, FALSE, 13);
@@ -83,15 +103,44 @@ int main(void) {
 
     handle_key('z', FALSE, 14, 14);
     handle_key('z', TRUE, 15, 15);
-    expect_message("EVENT:1:15:KEY:122:1");
+    expect_key_message(1, 15, 'z', 1);
     handle_reply(14, TRUE, 16);
     expect_no_message();
 
-    handle_key('r', FALSE, 17, 17);
+    handle_key('q', FALSE, 17, 17);
+    handle_key('q', FALSE, 18, 18);
+    handle_reply(17, TRUE, 19);
+    expect_key_message(1, 19, 'q', 0);
+    handle_reply(18, TRUE, 20);
+    expect_key_message(1, 20, 'q', 0);
+
+    handle_key('W', FALSE, 21, 21);
+    handle_key('w', TRUE, 22, 22);
+    expect_key_message(1, 22, 'w', 1);
+    handle_reply(21, TRUE, 23);
+    expect_no_message();
+
+    handle_key('q', FALSE, 24, 24);
+    cancel_pending_context(1);
+    handle_reply(24, TRUE, 25);
+    expect_no_message();
+
+    handle_key('r', FALSE, 26, 26);
     expect_no_message();
 
     contexts[0].hangul = 0;
-    handle_key('a', FALSE, 18, 18);
+    handle_key('a', FALSE, 27, 27);
     expect_no_message();
+
+    atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
+    enqueue_message("EVENT:1:28:KEYRESET:pending-overflow");
+    expect_message("EVENT:0:0:RESET:queue-drop");
+    expect_no_message();
+
+    for (size_t i = 0; i <= MAX_QUEUE_MESSAGES; i++)
+        enqueue_message("EVENT:1:%zu:KEYRESET:queue-limit", i);
+    expect_message("EVENT:0:0:RESET:queue-drop");
+    expect_no_message();
+
     return 0;
 }
