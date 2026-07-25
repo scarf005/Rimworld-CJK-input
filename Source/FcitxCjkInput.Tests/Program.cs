@@ -16,7 +16,7 @@ internal static class Program {
             DifferentCharacterIsNotSuppressedLater,
             CommittedCharacterSuppressionExpires,
             HangulDirectionalKeysRecoverCameraInput,
-            HangulShortcutPressesSurviveTheirReleaseUntilGuiHandling,
+            HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent,
             UnrelatedKeysAreNotRecovered,
             DirectionalKeysStayUnavailableInTextFields,
             ReleasedDirectionalKeysAreNotRecovered,
@@ -108,7 +108,7 @@ internal static class Program {
         Equal(false, GameplayKeyRecovery.ShouldRecover(false, false, false, 'w', 0, keys));
     }
 
-    private static void HangulShortcutPressesSurviveTheirReleaseUntilGuiHandling() {
+    private static void HangulShortcutPressesAreConsumedWithoutUnityKeyDownEvent() {
         var keys = new GameplayKeyState();
         keys.Update('q', false);
         keys.Update('q', true);
@@ -117,21 +117,11 @@ internal static class Program {
         keys.Update('z', false);
         keys.Update('z', true);
 
-        Equal(true, keys.WasPressed('q'));
-        Equal(true, keys.WasPressed('e'));
-        Equal(true, keys.WasPressed('z'));
-        Equal(true, GameplayKeyRecovery.ShouldRecoverPress(false, false, true,
-            'q', 0, keys));
-        Equal(true, GameplayKeyRecovery.ShouldRecoverPress(false, false, true,
-            0, 'e', keys));
-        Equal(false, GameplayKeyRecovery.ShouldRecoverPress(false, true, true,
-            'z', 0, keys));
-        Equal(false, GameplayKeyRecovery.ShouldRecoverPress(false, false, false,
-            'z', 0, keys));
-        keys.ClearPressed();
-        Equal(false, keys.WasPressed('q'));
-        Equal(false, keys.WasPressed('e'));
-        Equal(false, keys.WasPressed('z'));
+        Equal(true, keys.ConsumePress('q'));
+        Equal(false, keys.ConsumePress('q'));
+        Equal(true, keys.ConsumePress('e'));
+        Equal(true, keys.ConsumePress('z'));
+        Equal(false, keys.ConsumePress('z'));
     }
 
     private static void UnrelatedKeysAreNotRecovered() {
@@ -139,7 +129,7 @@ internal static class Program {
         keys.Update('r', false);
 
         Equal(false, keys.IsDown('r'));
-        Equal(false, keys.WasPressed('r'));
+        Equal(false, keys.ConsumePress('r'));
     }
 
     private static void DirectionalKeysStayUnavailableInTextFields() {
