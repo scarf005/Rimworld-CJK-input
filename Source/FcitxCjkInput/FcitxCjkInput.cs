@@ -50,7 +50,6 @@ namespace FcitxCjkInput {
         private static NativeStop _nativeStop;
         private static string _engine = "unknown";
         private static bool _nativeReady;
-        private static bool _overlay;
         private static int _overlayFrame = -1;
         private static bool _nativeLoaded;
         private static int _mainThreadId;
@@ -460,13 +459,6 @@ namespace FcitxCjkInput {
             if (currentEvent == null)
                 return;
             LogRootEvent(currentEvent, textFieldActive);
-
-            if (currentEvent.type == EventType.KeyDown && currentEvent.keyCode == KeyCode.F11) {
-                _overlay = !_overlay;
-                WriteLog("UI overlay=" + _overlay);
-                currentEvent.Use();
-                return;
-            }
         }
 
         private static void BeforeDesktopTextField(Rect position, int id, GUIContent content,
@@ -509,7 +501,7 @@ namespace FcitxCjkInput {
                 Composition.TryGetView(target, out var view))
                 DrawPreedit(editor, view);
 
-            if (Event.current.type == EventType.Repaint && _overlay && _overlayFrame != Time.frameCount) {
+            if (Event.current.type == EventType.Repaint && DebugLogging && _overlayFrame != Time.frameCount) {
                 _overlayFrame = Time.frameCount;
                 DrawOverlay();
             }
@@ -785,8 +777,7 @@ namespace FcitxCjkInput {
             var text = "[CJK] engine=" + _engine + " native=" + (_nativeReady ? "ready" : "waiting") +
                 " debug=" + (DebugLogging ? "on" : "off") + " focus=" +
                 GUIUtility.keyboardControl + " preedit=[" + Escape(preedit) +
-                "] context=" + Composition.ActiveContext + " commits=" + Composition.PendingCount +
-                "\nF11: diagnostics";
+                "] context=" + Composition.ActiveContext + " commits=" + Composition.PendingCount;
             GUI.Label(new Rect(10f, 10f, 900f, 48f), text, style);
         }
 
