@@ -50,7 +50,7 @@ install: build
     mkdir -p "{{mod_dest}}/1.6/Assemblies"
     mkdir -p "{{mod_dest}}/About"
     cp -r 1.6/Assemblies/* "{{mod_dest}}/1.6/Assemblies/"
-    cp About/About.xml "{{mod_dest}}/About/"
+    cp -r About/* "{{mod_dest}}/About/"
     rm -rf "{{mod_dest}}/helper" "{{mod_dest}}/Languages"
     @echo "Installed to {{mod_dest}}"
 

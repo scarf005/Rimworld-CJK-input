@@ -2,7 +2,7 @@
 <ModMetaData>
   <name>리눅스 Fcitx 한글 입력 / Fcitx CJK Input</name>
   <author>scarf</author>
-  <modVersion>0.0.1</modVersion>
+  <modVersion>0.0.2</modVersion>
   <packageId>scarf.cjkinput</packageId>
   <supportedVersions>
     <li>1.6</li>
@@ -33,6 +33,8 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 - Harmony
 - fcitx5
 - libdbus-1.so.3
+
+소스 코드: https://github.com/scarf005/Rimworld-CJK-input
 
 Fcitx5 CJK input support for RimWorld on Linux.
 
