@@ -8,7 +8,7 @@ on:
 
 env:
   RIMWORLD_VERSION: '1.6'
-  MOD_PACKAGE_ID: scarf.fcitxcjkinput
+  MOD_PACKAGE_ID: scarf.cjkinput
   SOLUTION_FILE: Source/FcitxCjkInput/FcitxCjkInput.csproj
   ASSEMBLY_DIR: 1.6/Assemblies
   RIMWORLD_REF: /tmp/rimworld-refs

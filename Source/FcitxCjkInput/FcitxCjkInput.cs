@@ -140,7 +140,7 @@ namespace FcitxCjkInput {
         }
 
         private static void Patch() {
-            var harmony = new Harmony("scarf.fcitxcjkinput");
+            var harmony = new Harmony("scarf.cjkinput");
             var rootOnGui = AccessTools.Method(typeof(Root), "OnGUI");
             var desktopTextField = AccessTools.Method(typeof(GUI), "HandleTextFieldEventForDesktop");
             var quickSearch = AccessTools.Method(typeof(QuickSearchWidget), nameof(QuickSearchWidget.OnGUI));
@@ -194,7 +194,7 @@ namespace FcitxCjkInput {
 
         private static void LoadNativeBridge() {
             var content = LoadedModManager.RunningModsListForReading
-                .FirstOrDefault(mod => mod.PackageId == "scarf.fcitxcjkinput");
+                .FirstOrDefault(mod => mod.PackageId == "scarf.cjkinput");
             var assemblyDirectory = content != null
                 ? Path.Combine(content.RootDir, "1.6", "Assemblies")
                 : Path.GetDirectoryName(typeof(FcitxCjkInputMod).Assembly.Location);
