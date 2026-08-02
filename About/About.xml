@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ModMetaData>
-  <name>Fcitx CJK Input</name>
+  <name>리눅스 Fcitx 한글 입력 / Fcitx CJK Input</name>
   <author>scarf</author>
+  <modVersion>0.0.1</modVersion>
   <packageId>scarf.fcitxcjkinput</packageId>
   <supportedVersions>
     <li>1.6</li>
@@ -18,10 +19,27 @@
       <downloadUrl>https://github.com/pardeike/HarmonyRimWorld/releases/latest</downloadUrl>
     </li>
   </modDependencies>
-  <description><![CDATA[Fcitx5 CJK input support for RimWorld on Linux.
+  <description><![CDATA[Linux용 RimWorld의 fcitx5 한글 입력을 지원합니다.
+
+주의 사항:
+1. 바이브 코딩으로 만들어진 프로그램이므로 사용에 유의하십시오.
+2. 불완전하게 지원하기 때문에 잔버그가 있습니다. 보통 한영키 변경 시 해결 가능합니다.
+
+Steam 시작 옵션:
+XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+
+요구 사항:
+- 네이티브 Linux RimWorld 1.6
+- Harmony
+- fcitx5
+- libdbus-1.so.3
+
+Fcitx5 CJK input support for RimWorld on Linux.
 
 Connects Unity's native SDL2/fcitx5 input context to RimWorld IMGUI text fields.
 Supports physical IME toggle keys, preedit text, commits, and cursor placement.
+
+WARNING: ENTIRELY VIBE CODED, USE AT YOUR OWN RISK
 
 Steam launch options:
 XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%

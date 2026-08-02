@@ -39,3 +39,5 @@ packages/
 
 # Rust build artifacts
 native-rs/target/
+
+*.gif
