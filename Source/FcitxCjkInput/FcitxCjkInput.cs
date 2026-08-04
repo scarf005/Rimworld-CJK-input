@@ -193,8 +193,9 @@ namespace FcitxCjkInput {
         }
 
         private static void LoadNativeBridge() {
+            var assembly = typeof(FcitxCjkInputMod).Assembly;
             var content = LoadedModManager.RunningModsListForReading
-                .FirstOrDefault(mod => mod.PackageId == "scarf.cjkinput");
+                .FirstOrDefault(mod => mod.assemblies.loadedAssemblies.Contains(assembly));
             var assemblyDirectory = content != null
                 ? Path.Combine(content.RootDir, "1.6", "Assemblies")
                 : Path.GetDirectoryName(typeof(FcitxCjkInputMod).Assembly.Location);

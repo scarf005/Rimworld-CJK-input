@@ -3,7 +3,7 @@ name: Build & Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['[0-9]*', 'v*']
   workflow_dispatch:
 
 env:
