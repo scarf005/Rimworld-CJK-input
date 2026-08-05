@@ -2,7 +2,7 @@
 <ModMetaData>
   <name>리눅스 Fcitx 한글 입력 / Fcitx CJK Input</name>
   <author>scarf</author>
-  <modVersion>0.0.2</modVersion>
+  <modVersion>0.0.3</modVersion>
   <packageId>scarf.cjkinput</packageId>
   <supportedVersions>
     <li>1.6</li>
@@ -48,6 +48,19 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 Requirements:
 - Native Linux RimWorld 1.6
+- Harmony
+- fcitx5
+- libdbus-1.so.3
+
+RimWorld Linux 版的 fcitx5 中文（及韩文）输入支持。
+
+注意事项：这是一个通过 vibe coding 编写的程序，使用时请自行承担风险。输入支持尚不完整，存在一些小问题，通常切换中英文后即可解决。
+
+Steam 启动选项：
+XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+
+要求：
+- 原生 Linux RimWorld 1.6
 - Harmony
 - fcitx5
 - libdbus-1.so.3]]></description>
