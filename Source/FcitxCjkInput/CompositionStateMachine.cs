@@ -25,6 +25,11 @@ namespace FcitxCjkInput {
             return keyboardControl != 0 && keyboardControl == focusedControl &&
                 currentFrame - lastSeenFrame <= 1;
         }
+
+        public static bool IsImeEngine(string engine) {
+            return !string.IsNullOrEmpty(engine) &&
+                !engine.StartsWith("keyboard", StringComparison.Ordinal);
+        }
     }
 
     internal static class InputSuppression {

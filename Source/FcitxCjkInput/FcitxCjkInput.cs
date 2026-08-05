@@ -401,7 +401,7 @@ namespace FcitxCjkInput {
                     return;
                 }
                 Engines.TryGetValue(contextId, out var engine);
-                if (engine == "hangul" && ContainsNonAscii(text) &&
+                if (ImeRouting.IsImeEngine(engine) && ContainsNonAscii(text) &&
                     Composition.Commit(contextId, sequence, text, now)) {
                     if (DebugLogging)
                         WriteLog("QUEUE commit context=" + contextId + " sequence=" + sequence +
