@@ -8,6 +8,7 @@ internal static class Program {
     private static int Main() {
         var tests = new Action[] {
             ImeActivationTracksFreshTextFieldFocus,
+            CjkEngineCommitsAreAccepted,
             GameplayKeysRemainAvailableOutsideTextFields,
             TextFieldRawHangulKeysAreSuppressed,
             BackspaceSuppressionRequiresFocusedPreedit,
@@ -51,6 +52,16 @@ internal static class Program {
         Equal(false, ImeRouting.TextFieldIsActive(0, 7, 100, 100));
         Equal(false, ImeRouting.TextFieldIsActive(8, 7, 100, 100));
         Equal(false, ImeRouting.TextFieldIsActive(7, 7, 98, 100));
+    }
+
+    private static void CjkEngineCommitsAreAccepted() {
+        Equal(true, ImeRouting.IsImeEngine("hangul"));
+        Equal(true, ImeRouting.IsImeEngine("rime"));
+        Equal(true, ImeRouting.IsImeEngine("pinyin"));
+        Equal(false, ImeRouting.IsImeEngine("keyboard-us"));
+        Equal(false, ImeRouting.IsImeEngine("keyboard-cn"));
+        Equal(false, ImeRouting.IsImeEngine(null));
+        Equal(false, ImeRouting.IsImeEngine(""));
     }
 
     private static void GameplayKeysRemainAvailableOutsideTextFields() {
