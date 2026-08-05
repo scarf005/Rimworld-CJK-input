@@ -1,5 +1,7 @@
 # 림월드 Fcitx 한글 입력 모드
 
+**Languages:** [中文](./README-ZH.md)
+
 [2026-08-02_21-47-01.webm](https://github.com/user-attachments/assets/a1b7641f-6de8-4f93-a83b-e5b79897f1c6)
 
 > [!CAUTION]
