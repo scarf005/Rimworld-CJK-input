@@ -1,6 +1,6 @@
 # RimWorld Fcitx 中文输入 Mod
 
-[preview-zh.webm](./assets/preview-zh.webm)
+https://github.com/user-attachments/assets/6b7c18dd-a4f0-4537-b2b8-d3a3a54d00eb
 
 > [!CAUTION]
 > 1. vibe-coding 产物，使用需谨慎。
