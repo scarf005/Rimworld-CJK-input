@@ -1,57 +1,67 @@
 rimworld := "/media/scarf/@steam/SteamLibrary/steamapps/common/RimWorld"
+rimworld_16 := env("RIMWORLD_1_6_DIR", "/media/scarf/@steam/RimWorld-1.6.4871-backup")
 config := "/home/scarf/.config/unity3d/Ludeon Studios/RimWorld by Ludeon Studios/Config/ModsConfig.xml"
-steam_os := "RimWorldLinux_Data"
 mod_name := "FcitxCjkInput"
 package_id := "scarf.cjkinput"
 mod_dest := rimworld + "/Mods/" + mod_name
-native_src := "native/fcitxcjkinput.c"
-native_test := "native/fcitxcjkinput_test.c"
-native_bin := "1.6/Assemblies/libfcitxcjkinput.so"
+dotnet := "mise exec dotnet@10.0.301 -- dotnet"
+native_libs := "$(pkg-config --cflags --libs dbus-1 xkbcommon wayland-client)"
+legacy_ref := env("RIMWORLD_1_6_REF", "rimworld-1.6")
+legacy_dir := "Source/obj/rimworld-1.6"
 
-# Download Harmony
+# Download Harmony for the RimWorld 1.6 build
 prepare:
     curl -LO https://github.com/pardeike/HarmonyRimWorld/releases/latest/download/HarmonyMod.zip
     7z x -y HarmonyMod.zip -opackages
 
-# Build the in-process native bridge
+# Build the RimWorld 1.7 fcitx5 client
 build-native:
-    mkdir -p "$(dirname {{native_bin}})"
-    gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
-        -o {{native_bin}} {{native_src}} $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
-    @echo "Native bridge built: {{native_bin}}"
+    mkdir -p 1.7/Assemblies
+    gcc -shared -fPIC -fvisibility=hidden -Wl,-soname,libfcitxcjkinput.so \
+        -o 1.7/Assemblies/libfcitxcjkinput.so native/fcitxcjkinput.c {{native_libs}} -Wall -Wextra -Werror -O2
 
 # Format C# source
 fmt:
-    dotnet format ./Source/{{mod_name}}/{{mod_name}}.sln
-    dotnet format ./Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj
+    {{dotnet}} format ./Source/{{mod_name}}/{{mod_name}}.csproj
+    {{dotnet}} format ./Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj
 
-# Test native directional-key events
+# Test Hangul composition against the running fcitx5 session
 test-native:
-    output="$(mktemp /tmp/fcitxcjkinput-test.XXXXXX)"; trap 'rm -f "$output"' 0; \
-        gcc -o "$output" {{native_test}} $(pkg-config --cflags --libs dbus-1) \
-        -pthread -Wall -Wextra -Werror; "$output"
+    mkdir -p Source/obj
+    gcc -o Source/obj/fcitxcjkinput_test native/fcitxcjkinput_test.c {{native_libs}} -Wall -Wextra -Werror
+    Source/obj/fcitxcjkinput_test
 
-# Build the C# mod
+# Build the RimWorld 1.7 assembly
 build-dll:
-    STEAM_APPS="{{rimworld}}/../.." \
-    STEAM_OS="{{steam_os}}" \
-    mise exec dotnet@8.0.422 -- dotnet build ./Source/{{mod_name}}/{{mod_name}}.csproj -c Release
+    RIMWORLD_DIR="{{rimworld}}" {{dotnet}} build ./Source/{{mod_name}}/{{mod_name}}.csproj -c Release
 
-# Run composition state-machine tests
+# Build the RimWorld 1.6 assembly and bridge from the frozen 1.6 branch (needs `just prepare`)
+build-16:
+    mkdir -p {{legacy_dir}}/steamapps/common 1.6/Assemblies
+    git archive {{legacy_ref}} Source native | tar -x -C {{legacy_dir}}
+    ln -sfn "{{rimworld_16}}" {{legacy_dir}}/steamapps/common/RimWorld
+    ln -sfn "$PWD/packages" {{legacy_dir}}/packages
+    STEAM_APPS="$PWD/{{legacy_dir}}/steamapps" STEAM_OS=RimWorldLinux_Data \
+        {{dotnet}} build {{legacy_dir}}/Source/{{mod_name}}/{{mod_name}}.csproj -c Release -p:OutputPath="$PWD/1.6/Assemblies/"
+    gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
+        -o 1.6/Assemblies/libfcitxcjkinput.so {{legacy_dir}}/native/fcitxcjkinput.c \
+        $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
+
+# Run event parsing tests
 test:
-    mise exec dotnet@8.0.422 -- dotnet run --project Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj -c Release
+    {{dotnet}} run --project Source/{{mod_name}}.Tests/{{mod_name}}.Tests.csproj -c Release
 
 # Build everything
-build: test test-native build-native build-dll
+build: test test-native build-native build-dll build-16
 
 # Install built mod to RimWorld Mods directory
 install: build
-    @pgrep -x RimWorldLinux >/dev/null 2>&1 && { echo "RimWorld is running — 설치 전에 종료해주세요"; exit 1; } || true
-    mkdir -p "{{mod_dest}}/1.6/Assemblies"
-    mkdir -p "{{mod_dest}}/About"
+    @pgrep -x RimWorld >/dev/null 2>&1 && { echo "RimWorld is running — 설치 전에 종료해주세요"; exit 1; } || true
+    mkdir -p "{{mod_dest}}/1.6/Assemblies" "{{mod_dest}}/1.7/Assemblies" "{{mod_dest}}/About"
     cp -r 1.6/Assemblies/* "{{mod_dest}}/1.6/Assemblies/"
+    cp -r 1.7/Assemblies/* "{{mod_dest}}/1.7/Assemblies/"
     cp -r About/* "{{mod_dest}}/About/"
-    rm -rf "{{mod_dest}}/helper" "{{mod_dest}}/Languages"
+    gio trash -f "{{mod_dest}}/helper" "{{mod_dest}}/Languages"
     @echo "Installed to {{mod_dest}}"
 
 # Install and enable in ModsConfig.xml
