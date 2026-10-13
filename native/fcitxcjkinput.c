@@ -1,755 +1,561 @@
 /*
- * Native fcitx5 signal bridge loaded in-process by FcitxCjkInput.dll.
+ * Native fcitx5 input-context client loaded in-process by FcitxCjkInput.dll.
+ *
+ * RimWorld 1.7 runs on GLFW without a Wayland text-input protocol, so fcitx5
+ * never sees its keys. This bridge owns an fcitx5 D-Bus input context, turns
+ * GLFW scancodes into keysyms with the compositor's XKB keymap, and forwards
+ * key events while a text field is focused.
  *
  * Public API:
- *   int fcitx_bridge_start(uint32_t rimworld_pid)
- *   int fcitx_bridge_poll(char *buffer, int capacity)
- *   void fcitx_bridge_stop(void)
+ *   int cjk_start(void)
+ *   void cjk_stop(void)
+ *   void cjk_focus(int focused)
+ *   void cjk_reset(void)
+ *   void cjk_reset_keys(void)
+ *   int cjk_key(uint32_t scancode, int action, uint32_t time, int forward)
+ *   int cjk_poll(char *buffer, int capacity)
  *
- * Queue messages:
- *   READY:<rimworld-pid>
- *   EVENT:<context-id>:<sequence>:ENGINE:<unique-name>
- *   EVENT:<context-id>:<sequence>:PREEDIT|HANGUL_PREEDIT:<UTF-8 byte cursor>:<UTF-8 hex>
- *   EVENT:<context-id>:<sequence>:COMMIT|HANGUL_COMMIT:<UTF-8 hex>
- *   EVENT:<context-id>:<sequence>:FOCUS:IN|OUT
- *   EVENT:<context-id>:<sequence>:KEY:<ASCII key value>:<release 0|1>:<monotonic ms>
- *   EVENT:<context-id>:<sequence>:KEYRESET:<reason>
- *   EVENT:0:0:RESET:<reason>
- *   STOPPED
- *   LOG:<diagnostic>
- *   ERROR:<diagnostic>
+ * Queue messages, fields separated by U+001F:
+ *   commit <text>
+ *   preedit <UTF-8 byte cursor> <text>
+ *   forward <UTF-32 codepoint> <keysym> <release 0|1>
+ *   panel <candidate index> <header> <candidate>...
+ *   focusout
  */
 
 #include <dbus/dbus.h>
-#include <errno.h>
-#include <pthread.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 
 #define EXPORT __attribute__((visibility("default")))
+#define FCITX_SERVICE "org.fcitx.Fcitx5"
+#define INPUT_METHOD_PATH "/org/freedesktop/portal/inputmethod"
+#define INPUT_METHOD_INTERFACE "org.fcitx.Fcitx.InputMethod1"
 #define INPUT_CONTEXT_INTERFACE "org.fcitx.Fcitx.InputContext1"
+#define SEPARATOR "\x1f"
+#define CALL_TIMEOUT_MS 200
 #define MAX_TEXT 4096
 #define MAX_MESSAGE 16384
-#define MAX_DESTINATIONS 16
-#define MAX_CONTEXTS 64
-#define MAX_PENDING_KEYS 128
-#define MAX_QUEUE_MESSAGES 512
+#define MAX_QUEUE_MESSAGES 256
 
-struct context_entry {
-    char destination[128];
-    char path[256];
-    int hangul;
-};
+/* fcitx-utils/capabilityflags.h */
+#define CAPABILITY_PREEDIT (1ULL << 1)
+#define CAPABILITY_FORMATTED_PREEDIT (1ULL << 4)
+#define CAPABILITY_KEY_EVENT_ORDER_FIX (1ULL << 37)
+#define CAPABILITY_CLIENT_SIDE_INPUT_PANEL (1ULL << 39)
 
-struct pending_key {
-    char client[128];
-    uint32_t serial;
-    uint32_t context;
-    uint32_t keyval;
-    uint32_t keycode;
-    uint32_t state;
-    dbus_bool_t release;
-    uint64_t observed_at_ms;
-    int recover;
-    int canceled;
-};
+/* dbusfrontend.cpp batched event kinds */
+enum { BATCHED_COMMIT_STRING, BATCHED_PREEDIT, BATCHED_FORWARD_KEY };
 
-struct message_node {
-    char *text;
-    struct message_node *next;
-};
+static DBusConnection *bus;
+static char context_path[256];
+static struct xkb_context *xkb;
+static struct xkb_keymap *keymap;
+static struct xkb_state *key_state;
+static uint32_t keycode_offset;
+static char *queue[MAX_QUEUE_MESSAGES];
+static int queue_head;
+static int queue_count;
 
-static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct message_node *queue_head;
-static struct message_node *queue_tail;
-static size_t queue_count;
-static pthread_t worker_thread;
-static int worker_created;
-static int dbus_threads_ready;
-static atomic_int running;
-static atomic_int debug_logging;
-static atomic_int restart_requested;
-static atomic_int queue_desynced;
-static uint32_t rimworld_pid;
-
-static DBusConnection *connection;
-static char rimworld_destinations[MAX_DESTINATIONS][128];
-static size_t rimworld_destination_count;
-static struct context_entry contexts[MAX_CONTEXTS];
-static size_t context_count;
-static uint64_t next_sequence;
-static struct pending_key pending_keys[MAX_PENDING_KEYS];
-static size_t next_pending_key;
-
-static void mark_queue_desynced(void) {
-    pthread_mutex_lock(&queue_mutex);
-    atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
-    pthread_mutex_unlock(&queue_mutex);
+static void enqueue(const char *message) {
+    if (queue_count == MAX_QUEUE_MESSAGES)
+        return;
+    queue[(queue_head + queue_count++) % MAX_QUEUE_MESSAGES] = strdup(message);
 }
 
-static struct message_node *create_message_node(const char *text) {
-    struct message_node *node = malloc(sizeof(*node));
-    if (!node) return NULL;
-    node->text = strdup(text);
-    if (!node->text) {
-        free(node);
-        return NULL;
+static void clear_queue(void) {
+    while (queue_count > 0) {
+        free(queue[queue_head]);
+        queue_head = (queue_head + 1) % MAX_QUEUE_MESSAGES;
+        queue_count--;
     }
-    node->next = NULL;
-    return node;
 }
 
-static void enqueue_message(const char *format, ...) {
-    const int log_message = strncmp(format, "LOG:", 4) == 0;
-    if (!atomic_load_explicit(&debug_logging, memory_order_relaxed) && log_message)
-        return;
-
-    char buffer[MAX_MESSAGE];
-    va_list args;
-    va_start(args, format);
-    const int length = vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-    if (length <= 0 || (size_t)length >= sizeof(buffer)) {
-        if (!log_message)
-            mark_queue_desynced();
-        return;
-    }
-
-    struct message_node *node = create_message_node(buffer);
-    if (!node) {
-        if (!log_message)
-            mark_queue_desynced();
-        return;
-    }
-
-    pthread_mutex_lock(&queue_mutex);
-    if (queue_count >= MAX_QUEUE_MESSAGES) {
-        if (!log_message)
-            atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
-        pthread_mutex_unlock(&queue_mutex);
-        free(node->text);
-        free(node);
-        return;
-    }
-    if (queue_tail) queue_tail->next = node;
-    else queue_head = node;
-    queue_tail = node;
-    queue_count++;
-    pthread_mutex_unlock(&queue_mutex);
-}
-
-static void enqueue_hex(const char *prefix, const char *text) {
-    static const char digits[] = "0123456789ABCDEF";
-    const size_t prefix_length = strlen(prefix);
-    const size_t text_length = strlen(text);
-    const size_t length = prefix_length + 1 + text_length * 2;
-    char *message = malloc(length + 1);
-    if (!message) {
-        mark_queue_desynced();
-        return;
-    }
-
-    memcpy(message, prefix, prefix_length);
-    message[prefix_length] = ':';
-    for (size_t i = 0; i < text_length; i++) {
-        const unsigned char byte = (unsigned char)text[i];
-        message[prefix_length + 1 + i * 2] = digits[byte >> 4];
-        message[prefix_length + 2 + i * 2] = digits[byte & 0x0f];
-    }
-    message[length] = '\0';
-    enqueue_message("%s", message);
-    free(message);
-}
-
-static uint32_t connection_pid(const char *name) {
-    DBusMessage *request = dbus_message_new_method_call(
-        DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS,
-        "GetConnectionUnixProcessID");
-    if (!request) return 0;
-    dbus_message_append_args(request, DBUS_TYPE_STRING, &name, DBUS_TYPE_INVALID);
-
-    DBusError error;
-    dbus_error_init(&error);
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
-        connection, request, 1000, &error);
-    dbus_message_unref(request);
-    if (!reply) {
-        enqueue_message("ERROR:pid lookup destination=%s error=%s", name,
-            dbus_error_is_set(&error) ? error.message : "no reply");
-        dbus_error_free(&error);
-        return 0;
-    }
-
-    uint32_t pid = 0;
-    if (!dbus_message_get_args(reply, &error, DBUS_TYPE_UINT32, &pid,
-            DBUS_TYPE_INVALID)) {
-        enqueue_message("ERROR:pid reply destination=%s error=%s", name,
-            dbus_error_is_set(&error) ? error.message : "invalid reply");
-        dbus_error_free(&error);
-    }
-    dbus_message_unref(reply);
-    return pid;
-}
-
-static int discover_rimworld_destinations(void) {
-    DBusMessage *request = dbus_message_new_method_call(
-        DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, DBUS_INTERFACE_DBUS, "ListNames");
-    if (!request) return 0;
-
-    DBusError error;
-    dbus_error_init(&error);
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
-        connection, request, 1000, &error);
-    dbus_message_unref(request);
-    if (!reply) {
-        enqueue_message("ERROR:ListNames error=%s",
-            dbus_error_is_set(&error) ? error.message : "no reply");
-        dbus_error_free(&error);
-        return 0;
-    }
-
-    DBusMessageIter root;
-    if (!dbus_message_iter_init(reply, &root) ||
-        dbus_message_iter_get_arg_type(&root) != DBUS_TYPE_ARRAY) {
-        dbus_message_unref(reply);
-        return 0;
-    }
-
-    rimworld_destination_count = 0;
-    DBusMessageIter names;
-    dbus_message_iter_recurse(&root, &names);
-    while (dbus_message_iter_get_arg_type(&names) == DBUS_TYPE_STRING &&
-        rimworld_destination_count < MAX_DESTINATIONS) {
-        const char *name = "";
-        dbus_message_iter_get_basic(&names, &name);
-        if (name[0] == ':' && connection_pid(name) == rimworld_pid) {
-            snprintf(rimworld_destinations[rimworld_destination_count],
-                sizeof(rimworld_destinations[0]), "%s", name);
-            enqueue_message("LOG:target destination=%s pid=%u", name, rimworld_pid);
-            rimworld_destination_count++;
+static void keymap_handler(void *data, struct wl_keyboard *keyboard, uint32_t format, int32_t fd,
+    uint32_t size) {
+    (void)data;
+    (void)keyboard;
+    if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && keymap == NULL) {
+        char *text = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (text != MAP_FAILED) {
+            keymap = xkb_keymap_new_from_string(xkb, text, XKB_KEYMAP_FORMAT_TEXT_V1,
+                XKB_KEYMAP_COMPILE_NO_FLAGS);
+            munmap(text, size);
         }
-        dbus_message_iter_next(&names);
     }
-    dbus_message_unref(reply);
-    return rimworld_destination_count > 0;
+    close(fd);
 }
 
-static int become_monitor(void) {
-    DBusMessage *request = dbus_message_new_method_call(
-        DBUS_SERVICE_DBUS, DBUS_PATH_DBUS, "org.freedesktop.DBus.Monitoring",
-        "BecomeMonitor");
-    if (!request) return 0;
+static void ignore_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+    struct wl_surface *surface, struct wl_array *keys) {
+    (void)data, (void)keyboard, (void)serial, (void)surface, (void)keys;
+}
 
-    DBusMessageIter root;
-    DBusMessageIter rules;
-    dbus_message_iter_init_append(request, &root);
-    dbus_message_iter_open_container(&root, DBUS_TYPE_ARRAY, "s", &rules);
-    char rule_buffer[256];
-    for (size_t i = 0; i < rimworld_destination_count; i++) {
-        snprintf(rule_buffer, sizeof(rule_buffer),
-            "type='signal',interface='org.fcitx.Fcitx.InputContext1',destination='%.127s'",
-            rimworld_destinations[i]);
-        const char *rule = rule_buffer;
-        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        snprintf(rule_buffer, sizeof(rule_buffer),
-            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='FocusIn',sender='%.127s'",
-            rimworld_destinations[i]);
-        rule = rule_buffer;
-        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        snprintf(rule_buffer, sizeof(rule_buffer),
-            "type='method_call',interface='org.fcitx.Fcitx.InputContext1',member='ProcessKeyEvent',sender='%.127s'",
-            rimworld_destinations[i]);
-        rule = rule_buffer;
-        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        snprintf(rule_buffer, sizeof(rule_buffer),
-            "type='method_return',destination='%.127s'", rimworld_destinations[i]);
-        rule = rule_buffer;
-        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
-        snprintf(rule_buffer, sizeof(rule_buffer),
-            "type='error',destination='%.127s'", rimworld_destinations[i]);
-        rule = rule_buffer;
-        dbus_message_iter_append_basic(&rules, DBUS_TYPE_STRING, &rule);
+static void ignore_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+    struct wl_surface *surface) {
+    (void)data, (void)keyboard, (void)serial, (void)surface;
+}
+
+static void ignore_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
+    uint32_t key, uint32_t state) {
+    (void)data, (void)keyboard, (void)serial, (void)time, (void)key, (void)state;
+}
+
+static void ignore_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+    uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+    (void)data, (void)keyboard, (void)serial, (void)depressed, (void)latched, (void)locked,
+        (void)group;
+}
+
+static void ignore_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate,
+    int32_t delay) {
+    (void)data, (void)keyboard, (void)rate, (void)delay;
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    keymap_handler, ignore_enter, ignore_leave, ignore_key, ignore_modifiers, ignore_repeat_info,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) {
+    struct wl_keyboard **keyboard = data;
+    if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) && *keyboard == NULL) {
+        *keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(*keyboard, &keyboard_listener, NULL);
     }
-    dbus_message_iter_close_container(&root, &rules);
-    uint32_t flags = 0;
-    dbus_message_iter_append_basic(&root, DBUS_TYPE_UINT32, &flags);
+}
 
-    DBusError error;
-    dbus_error_init(&error);
-    DBusMessage *reply = dbus_connection_send_with_reply_and_block(
-        connection, request, 1000, &error);
-    dbus_message_unref(request);
-    if (!reply) {
-        enqueue_message("ERROR:BecomeMonitor error=%s",
-            dbus_error_is_set(&error) ? error.message : "no reply");
-        dbus_error_free(&error);
+static void seat_name(void *data, struct wl_seat *seat, const char *name) {
+    (void)data, (void)seat, (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = { seat_capabilities, seat_name };
+
+static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
+    const char *interface, uint32_t version) {
+    struct wl_seat **seat = data;
+    (void)version;
+    if (*seat == NULL && strcmp(interface, wl_seat_interface.name) == 0)
+        *seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+}
+
+static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
+    (void)data, (void)registry, (void)name;
+}
+
+static const struct wl_registry_listener registry_listener = {
+    registry_global, registry_global_remove,
+};
+
+/* GLFW reports evdev scancodes on Wayland and X11 keycodes on X11. */
+static void load_keymap(void) {
+    struct wl_display *display = getenv("WAYLAND_DISPLAY") ? wl_display_connect(NULL) : NULL;
+    if (display != NULL) {
+        struct wl_seat *seat = NULL;
+        struct wl_keyboard *keyboard = NULL;
+        struct wl_registry *registry = wl_display_get_registry(display);
+        wl_registry_add_listener(registry, &registry_listener, &seat);
+        wl_display_roundtrip(display);
+        if (seat != NULL) {
+            wl_seat_add_listener(seat, &seat_listener, &keyboard);
+            wl_display_roundtrip(display);
+            wl_display_roundtrip(display);
+        }
+        if (keyboard != NULL)
+            wl_keyboard_destroy(keyboard);
+        if (seat != NULL)
+            wl_seat_destroy(seat);
+        wl_registry_destroy(registry);
+        wl_display_disconnect(display);
+        keycode_offset = 8;
+    }
+    if (keymap == NULL)
+        keymap = xkb_keymap_new_from_names(xkb, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
+}
+
+static uint32_t x11_modifiers(void) {
+    static const struct {
+        const char *name;
+        uint32_t mask;
+    } modifiers[] = {
+        { XKB_MOD_NAME_SHIFT, 1 << 0 },
+        { XKB_MOD_NAME_CAPS, 1 << 1 },
+        { XKB_MOD_NAME_CTRL, 1 << 2 },
+        { XKB_MOD_NAME_ALT, 1 << 3 },
+        { XKB_MOD_NAME_NUM, 1 << 4 },
+        { XKB_MOD_NAME_LOGO, 1 << 6 },
+    };
+    uint32_t mask = 0;
+    for (size_t i = 0; i < sizeof modifiers / sizeof modifiers[0]; i++) {
+        if (xkb_state_mod_name_is_active(key_state, modifiers[i].name, XKB_STATE_MODS_EFFECTIVE) > 0)
+            mask |= modifiers[i].mask;
+    }
+    return mask;
+}
+
+static int append(char *buffer, size_t capacity, const char *text) {
+    size_t length = strlen(buffer);
+    size_t add = strlen(text);
+    if (length + add >= capacity)
         return 0;
-    }
-    dbus_message_unref(reply);
+    memcpy(buffer + length, text, add + 1);
     return 1;
 }
 
-static const char *client_name(DBusMessage *message) {
-    return dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_SIGNAL
-        ? dbus_message_get_destination(message)
-        : dbus_message_get_sender(message);
+/* Concatenates the text of an a(si) formatted-text array. */
+static void read_formatted(DBusMessageIter *array, char *buffer, size_t capacity) {
+    DBusMessageIter item;
+    buffer[0] = '\0';
+    if (dbus_message_iter_get_arg_type(array) != DBUS_TYPE_ARRAY)
+        return;
+    dbus_message_iter_recurse(array, &item);
+    while (dbus_message_iter_get_arg_type(&item) == DBUS_TYPE_STRUCT) {
+        DBusMessageIter field;
+        const char *text = "";
+        dbus_message_iter_recurse(&item, &field);
+        dbus_message_iter_get_basic(&field, &text);
+        append(buffer, capacity, text);
+        dbus_message_iter_next(&item);
+    }
 }
 
-static int is_rimworld_destination(const char *client) {
-    if (!client || client[0] != ':') return 0;
-    for (size_t i = 0; i < rimworld_destination_count; i++) {
-        if (strcmp(client, rimworld_destinations[i]) == 0) return 1;
+static void enqueue_commit(const char *text) {
+    char message[MAX_MESSAGE];
+    snprintf(message, sizeof message, "commit" SEPARATOR "%s", text);
+    enqueue(message);
+}
+
+/* Reads the a(si)i preedit payload at iter. */
+static void enqueue_preedit(DBusMessageIter *iter) {
+    char text[MAX_TEXT];
+    char message[MAX_MESSAGE];
+    int32_t cursor = 0;
+    read_formatted(iter, text, sizeof text);
+    dbus_message_iter_next(iter);
+    if (dbus_message_iter_get_arg_type(iter) == DBUS_TYPE_INT32)
+        dbus_message_iter_get_basic(iter, &cursor);
+    snprintf(message, sizeof message, "preedit" SEPARATOR "%d" SEPARATOR "%s", cursor, text);
+    enqueue(message);
+}
+
+static void enqueue_forward(uint32_t keysym, dbus_bool_t release) {
+    char message[MAX_MESSAGE];
+    snprintf(message, sizeof message, "forward" SEPARATOR "%u" SEPARATOR "%u" SEPARATOR "%d",
+        xkb_keysym_to_utf32(keysym), keysym, release ? 1 : 0);
+    enqueue(message);
+}
+
+/* Reads a(si)ia(si)a(si)a(ss)iibb from UpdateClientSideUI. */
+static void enqueue_panel(DBusMessage *signal) {
+    DBusMessageIter iter;
+    DBusMessageIter candidates;
+    char preedit[MAX_TEXT];
+    char aux_up[MAX_TEXT];
+    char aux_down[MAX_TEXT];
+    char header[MAX_TEXT * 3];
+    char message[MAX_MESSAGE];
+    int32_t index = -1;
+    if (!dbus_message_iter_init(signal, &iter))
+        return;
+    read_formatted(&iter, preedit, sizeof preedit);
+    dbus_message_iter_next(&iter);
+    dbus_message_iter_next(&iter);
+    read_formatted(&iter, aux_up, sizeof aux_up);
+    dbus_message_iter_next(&iter);
+    read_formatted(&iter, aux_down, sizeof aux_down);
+    dbus_message_iter_next(&iter);
+    candidates = iter;
+    dbus_message_iter_next(&iter);
+    if (dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_INT32)
+        dbus_message_iter_get_basic(&iter, &index);
+    snprintf(header, sizeof header, "%s%s%s", aux_up, preedit, aux_down);
+    snprintf(message, sizeof message, "panel" SEPARATOR "%d" SEPARATOR "%s", index, header);
+    if (dbus_message_iter_get_arg_type(&candidates) == DBUS_TYPE_ARRAY) {
+        DBusMessageIter item;
+        dbus_message_iter_recurse(&candidates, &item);
+        while (dbus_message_iter_get_arg_type(&item) == DBUS_TYPE_STRUCT) {
+            DBusMessageIter field;
+            const char *label = "";
+            const char *text = "";
+            dbus_message_iter_recurse(&item, &field);
+            dbus_message_iter_get_basic(&field, &label);
+            dbus_message_iter_next(&field);
+            dbus_message_iter_get_basic(&field, &text);
+            if (!append(message, sizeof message, SEPARATOR) ||
+                !append(message, sizeof message, label) || !append(message, sizeof message, text))
+                break;
+            dbus_message_iter_next(&item);
+        }
     }
+    enqueue(message);
+}
+
+/* Reads the a(uv) events returned by ProcessKeyEventBatch. */
+static void enqueue_batch(DBusMessageIter *array) {
+    DBusMessageIter item;
+    dbus_message_iter_recurse(array, &item);
+    while (dbus_message_iter_get_arg_type(&item) == DBUS_TYPE_STRUCT) {
+        DBusMessageIter field;
+        DBusMessageIter variant;
+        uint32_t kind = 0;
+        dbus_message_iter_recurse(&item, &field);
+        dbus_message_iter_get_basic(&field, &kind);
+        dbus_message_iter_next(&field);
+        dbus_message_iter_recurse(&field, &variant);
+        if (kind == BATCHED_COMMIT_STRING &&
+            dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
+            const char *text = "";
+            dbus_message_iter_get_basic(&variant, &text);
+            enqueue_commit(text);
+        } else if (kind == BATCHED_PREEDIT &&
+            dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRUCT) {
+            DBusMessageIter preedit;
+            dbus_message_iter_recurse(&variant, &preedit);
+            enqueue_preedit(&preedit);
+        } else if (kind == BATCHED_FORWARD_KEY &&
+            dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRUCT) {
+            DBusMessageIter key;
+            uint32_t keysym = 0;
+            uint32_t state = 0;
+            dbus_bool_t release = FALSE;
+            dbus_message_iter_recurse(&variant, &key);
+            dbus_message_iter_get_basic(&key, &keysym);
+            dbus_message_iter_next(&key);
+            dbus_message_iter_get_basic(&key, &state);
+            dbus_message_iter_next(&key);
+            dbus_message_iter_get_basic(&key, &release);
+            enqueue_forward(keysym, release);
+        }
+        dbus_message_iter_next(&item);
+    }
+}
+
+static void handle_signal(DBusMessage *signal) {
+    DBusMessageIter iter;
+    if (strcmp(dbus_message_get_path(signal) ?: "", context_path) != 0)
+        return;
+    if (dbus_message_is_signal(signal, INPUT_CONTEXT_INTERFACE, "CommitString")) {
+        const char *text = "";
+        if (dbus_message_get_args(signal, NULL, DBUS_TYPE_STRING, &text, DBUS_TYPE_INVALID))
+            enqueue_commit(text);
+    } else if (dbus_message_is_signal(signal, INPUT_CONTEXT_INTERFACE, "UpdateFormattedPreedit")) {
+        if (dbus_message_iter_init(signal, &iter))
+            enqueue_preedit(&iter);
+    } else if (dbus_message_is_signal(signal, INPUT_CONTEXT_INTERFACE, "UpdateClientSideUI")) {
+        enqueue_panel(signal);
+    } else if (dbus_message_is_signal(signal, INPUT_CONTEXT_INTERFACE, "ForwardKey")) {
+        uint32_t keysym = 0;
+        uint32_t state = 0;
+        dbus_bool_t release = FALSE;
+        if (dbus_message_get_args(signal, NULL, DBUS_TYPE_UINT32, &keysym, DBUS_TYPE_UINT32, &state,
+                DBUS_TYPE_BOOLEAN, &release, DBUS_TYPE_INVALID))
+            enqueue_forward(keysym, release);
+    } else if (dbus_message_is_signal(signal, INPUT_CONTEXT_INTERFACE, "NotifyFocusOut")) {
+        enqueue("focusout");
+    }
+}
+
+static void pump(void) {
+    DBusMessage *message;
+    if (bus == NULL)
+        return;
+    dbus_connection_read_write(bus, 0);
+    while ((message = dbus_connection_pop_message(bus)) != NULL) {
+        if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_SIGNAL)
+            handle_signal(message);
+        dbus_message_unref(message);
+    }
+}
+
+/* Sends a context method and waits, so signals it emits are queued before its reply. */
+static DBusMessage *call(const char *method, int first_type, ...) {
+    DBusMessage *message;
+    DBusMessage *reply;
+    va_list args;
+    if (bus == NULL || context_path[0] == '\0')
+        return NULL;
+    message = dbus_message_new_method_call(FCITX_SERVICE, context_path, INPUT_CONTEXT_INTERFACE,
+        method);
+    va_start(args, first_type);
+    dbus_message_append_args_valist(message, first_type, args);
+    va_end(args);
+    reply = dbus_connection_send_with_reply_and_block(bus, message, CALL_TIMEOUT_MS, NULL);
+    dbus_message_unref(message);
+    return reply;
+}
+
+static void call_void(const char *method, int first_type, ...) {
+    DBusMessage *message;
+    va_list args;
+    if (bus == NULL || context_path[0] == '\0')
+        return;
+    message = dbus_message_new_method_call(FCITX_SERVICE, context_path, INPUT_CONTEXT_INTERFACE,
+        method);
+    va_start(args, first_type);
+    dbus_message_append_args_valist(message, first_type, args);
+    va_end(args);
+    dbus_connection_send(bus, message, NULL);
+    dbus_connection_flush(bus);
+    dbus_message_unref(message);
+}
+
+static int create_context(void) {
+    DBusMessage *message = dbus_message_new_method_call(FCITX_SERVICE, INPUT_METHOD_PATH,
+        INPUT_METHOD_INTERFACE, "CreateInputContext");
+    DBusMessageIter iter;
+    DBusMessageIter array;
+    DBusMessage *reply;
+    const char *arguments[][2] = { { "program", "RimWorld" }, { "display", "wayland:" } };
+    const char *path = NULL;
+    dbus_uint64_t capability = CAPABILITY_PREEDIT | CAPABILITY_FORMATTED_PREEDIT |
+        CAPABILITY_KEY_EVENT_ORDER_FIX | CAPABILITY_CLIENT_SIDE_INPUT_PANEL;
+    char rule[512];
+
+    dbus_message_iter_init_append(message, &iter);
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "(ss)", &array);
+    for (size_t i = 0; i < sizeof arguments / sizeof arguments[0]; i++) {
+        DBusMessageIter pair;
+        dbus_message_iter_open_container(&array, DBUS_TYPE_STRUCT, NULL, &pair);
+        dbus_message_iter_append_basic(&pair, DBUS_TYPE_STRING, &arguments[i][0]);
+        dbus_message_iter_append_basic(&pair, DBUS_TYPE_STRING, &arguments[i][1]);
+        dbus_message_iter_close_container(&array, &pair);
+    }
+    dbus_message_iter_close_container(&iter, &array);
+    reply = dbus_connection_send_with_reply_and_block(bus, message, CALL_TIMEOUT_MS * 5, NULL);
+    dbus_message_unref(message);
+    if (reply == NULL)
+        return -1;
+    if (dbus_message_iter_init(reply, &iter) &&
+        dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_OBJECT_PATH)
+        dbus_message_iter_get_basic(&iter, &path);
+    if (path != NULL)
+        snprintf(context_path, sizeof context_path, "%s", path);
+    dbus_message_unref(reply);
+    if (context_path[0] == '\0')
+        return -1;
+
+    snprintf(rule, sizeof rule, "type='signal',interface='%s',path='%s'", INPUT_CONTEXT_INTERFACE,
+        context_path);
+    dbus_bus_add_match(bus, rule, NULL);
+    call_void("SetCapability", DBUS_TYPE_UINT64, &capability, DBUS_TYPE_INVALID);
     return 0;
 }
 
-static int is_rimworld_message(DBusMessage *message) {
-    return is_rimworld_destination(client_name(message));
-}
-
-static uint32_t context_id(DBusMessage *message) {
-    const char *client = client_name(message);
-    const char *path = dbus_message_get_path(message);
-    if (!client || !path) return 0;
-
-    for (size_t i = 0; i < context_count; i++) {
-        if (strcmp(contexts[i].destination, client) == 0 &&
-            strcmp(contexts[i].path, path) == 0)
-            return (uint32_t)(i + 1);
+EXPORT void cjk_stop(void) {
+    if (bus != NULL) {
+        call_void("DestroyIC", DBUS_TYPE_INVALID);
+        dbus_connection_close(bus);
+        dbus_connection_unref(bus);
+        bus = NULL;
     }
-    if (context_count >= MAX_CONTEXTS) return 0;
-
-    struct context_entry *entry = &contexts[context_count++];
-    snprintf(entry->destination, sizeof(entry->destination), "%s", client);
-    snprintf(entry->path, sizeof(entry->path), "%s", path);
-    entry->hangul = 0;
-    enqueue_message("LOG:context id=%zu destination=%s path=%s",
-        context_count, client, path);
-    return (uint32_t)context_count;
+    context_path[0] = '\0';
+    clear_queue();
+    if (key_state != NULL)
+        xkb_state_unref(key_state);
+    if (keymap != NULL)
+        xkb_keymap_unref(keymap);
+    if (xkb != NULL)
+        xkb_context_unref(xkb);
+    key_state = NULL;
+    keymap = NULL;
+    xkb = NULL;
 }
 
-static int read_string(DBusMessage *message, char *buffer, size_t size) {
-    DBusError error;
-    dbus_error_init(&error);
-    const char *text = "";
-    if (!dbus_message_get_args(message, &error, DBUS_TYPE_STRING, &text,
-            DBUS_TYPE_INVALID)) {
-        enqueue_message("ERROR:string parse member=%s error=%s",
-            dbus_message_get_member(message),
-            dbus_error_is_set(&error) ? error.message : "invalid signal");
-        dbus_error_free(&error);
-        return 0;
-    }
-    snprintf(buffer, size, "%s", text);
-    return 1;
+/* Returns 0 on success, -1 without a keymap, -2 without fcitx5. */
+EXPORT int cjk_start(void) {
+    cjk_stop();
+    xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (xkb == NULL)
+        return -1;
+    load_keymap();
+    if (keymap == NULL)
+        return -1;
+    key_state = xkb_state_new(keymap);
+    bus = dbus_bus_get_private(DBUS_BUS_SESSION, NULL);
+    if (bus == NULL)
+        return -2;
+    dbus_connection_set_exit_on_disconnect(bus, FALSE);
+    return create_context() == 0 ? 0 : -2;
 }
 
-static int read_preedit(DBusMessage *message, char *buffer, size_t size,
-    int32_t *cursor) {
-    DBusMessageIter root;
-    if (!dbus_message_iter_init(message, &root) ||
-        dbus_message_iter_get_arg_type(&root) != DBUS_TYPE_ARRAY)
-        return 0;
-
-    buffer[0] = '\0';
-    size_t used = 0;
-    DBusMessageIter array;
-    dbus_message_iter_recurse(&root, &array);
-    while (dbus_message_iter_get_arg_type(&array) == DBUS_TYPE_STRUCT) {
-        DBusMessageIter entry;
-        dbus_message_iter_recurse(&array, &entry);
-        if (dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_STRING) {
-            const char *part = "";
-            dbus_message_iter_get_basic(&entry, &part);
-            const size_t part_length = strlen(part);
-            if (part_length >= size - used) return 0;
-            memcpy(buffer + used, part, part_length);
-            used += part_length;
-            buffer[used] = '\0';
-        }
-        dbus_message_iter_next(&array);
-    }
-
-    if (!dbus_message_iter_next(&root) ||
-        dbus_message_iter_get_arg_type(&root) != DBUS_TYPE_INT32)
-        return 0;
-    dbus_message_iter_get_basic(&root, cursor);
-    return 1;
+EXPORT void cjk_focus(int focused) {
+    call_void(focused ? "FocusIn" : "FocusOut", DBUS_TYPE_INVALID);
 }
 
-static uint64_t monotonic_millis(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
-    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+/* Discards the composition; any commit it causes is queued before this returns. */
+EXPORT void cjk_reset(void) {
+    DBusMessage *reply = call("Reset", DBUS_TYPE_INVALID);
+    if (reply != NULL)
+        dbus_message_unref(reply);
+    pump();
 }
 
-static int is_recoverable_key(uint32_t keyval) {
-    return keyval == 'a' || keyval == 'A' || keyval == 'd' || keyval == 'D' ||
-        keyval == 's' || keyval == 'S' || keyval == 'w' || keyval == 'W' ||
-        keyval == 'q' || keyval == 'Q' || keyval == 'e' || keyval == 'E' ||
-        keyval == 'z' || keyval == 'Z';
-}
-
-static struct pending_key *find_pending_key(const char *client, uint32_t serial) {
-    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
-        if (pending_keys[i].serial == serial &&
-            strcmp(pending_keys[i].client, client) == 0)
-            return &pending_keys[i];
-    }
-    return NULL;
-}
-
-static void cancel_pending_key(uint32_t context, uint32_t keycode) {
-    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
-        if (pending_keys[i].serial != 0 && pending_keys[i].recover &&
-            pending_keys[i].context == context && pending_keys[i].keycode == keycode)
-            pending_keys[i].canceled = 1;
-    }
-}
-
-static void cancel_pending_context(uint32_t context) {
-    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
-        if (pending_keys[i].serial != 0 && pending_keys[i].context == context)
-            pending_keys[i].canceled = 1;
-    }
-}
-
-static struct pending_key *reserve_pending_key(uint32_t context,
-    unsigned long long sequence) {
-    for (size_t i = 0; i < MAX_PENDING_KEYS; i++) {
-        struct pending_key *pending =
-            &pending_keys[next_pending_key++ % MAX_PENDING_KEYS];
-        if (pending->serial == 0) return pending;
-    }
-    memset(pending_keys, 0, sizeof(pending_keys));
-    next_pending_key = 0;
-    enqueue_message("EVENT:%u:%llu:KEYRESET:pending-overflow", context, sequence);
-    return &pending_keys[next_pending_key++];
-}
-
-static void handle_process_key(DBusMessage *message, uint32_t context,
-    unsigned long long sequence) {
-    DBusError error;
-    dbus_error_init(&error);
-    uint32_t keyval = 0;
-    uint32_t keycode = 0;
-    uint32_t state = 0;
-    dbus_bool_t release = FALSE;
-    uint32_t time = 0;
-    if (!dbus_message_get_args(message, &error,
-            DBUS_TYPE_UINT32, &keyval,
-            DBUS_TYPE_UINT32, &keycode,
-            DBUS_TYPE_UINT32, &state,
-            DBUS_TYPE_BOOLEAN, &release,
-            DBUS_TYPE_UINT32, &time,
-            DBUS_TYPE_INVALID)) {
-        enqueue_message("ERROR:ProcessKeyEvent context=%u error=%s", context,
-            dbus_error_is_set(&error) ? error.message : "invalid signal");
-        dbus_error_free(&error);
+EXPORT void cjk_reset_keys(void) {
+    if (key_state == NULL)
         return;
-    }
-    const uint64_t observed_at_ms = monotonic_millis();
-    const int recoverable = contexts[context - 1].hangul &&
-        is_recoverable_key(keyval);
-    if (recoverable && release) {
-        cancel_pending_key(context, keycode);
-        enqueue_message("EVENT:%u:%llu:KEY:%u:1:%llu", context, sequence, keyval,
-            (unsigned long long)observed_at_ms);
-    }
-
-    const int debug = atomic_load_explicit(&debug_logging, memory_order_relaxed);
-    const int recover = recoverable && !release;
-    const uint32_t serial = dbus_message_get_serial(message);
-    if (debug || recover) {
-        struct pending_key *pending = reserve_pending_key(context, sequence);
-        snprintf(pending->client, sizeof(pending->client), "%s", client_name(message));
-        pending->serial = serial;
-        pending->context = context;
-        pending->keyval = keyval;
-        pending->keycode = keycode;
-        pending->state = state;
-        pending->release = release;
-        pending->observed_at_ms = observed_at_ms;
-        pending->recover = recover;
-        pending->canceled = 0;
-    }
-    enqueue_message("LOG:ProcessKeyEvent serial=%u context=%u keyval=%u keycode=%u state=%u release=%d time=%u hangul=%d recover=%d",
-        serial, context, keyval, keycode, state, release, time,
-        contexts[context - 1].hangul, recover);
+    xkb_state_unref(key_state);
+    key_state = xkb_state_new(keymap);
 }
 
-static void handle_process_key_reply(DBusMessage *message,
-    unsigned long long sequence) {
-    if (!is_rimworld_destination(dbus_message_get_destination(message))) return;
-    const char *client = dbus_message_get_destination(message);
-    const uint32_t reply_serial = dbus_message_get_reply_serial(message);
-    struct pending_key *pending = find_pending_key(client, reply_serial);
-    if (!pending) return;
-
-    if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_ERROR) {
-        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u release=%d recover=%d canceled=%d error=%s",
-            reply_serial, pending->context, pending->keyval, pending->keycode,
-            pending->release, pending->recover, pending->canceled,
-            dbus_message_get_error_name(message));
-        pending->serial = 0;
-        return;
-    }
-
-    DBusError error;
-    dbus_error_init(&error);
-    dbus_bool_t accepted = FALSE;
-    if (dbus_message_get_args(message, &error, DBUS_TYPE_BOOLEAN, &accepted,
-            DBUS_TYPE_INVALID)) {
-        if (pending->recover && !pending->canceled && accepted)
-            enqueue_message("EVENT:%u:%llu:KEY:%u:0:%llu", pending->context, sequence,
-                pending->keyval, (unsigned long long)pending->observed_at_ms);
-        enqueue_message("LOG:ProcessKeyReply serial=%u context=%u keyval=%u keycode=%u state=%u release=%d accepted=%d recover=%d canceled=%d",
-            reply_serial, pending->context, pending->keyval, pending->keycode,
-            pending->state, pending->release, accepted, pending->recover,
-            pending->canceled);
-    } else {
-        enqueue_message("ERROR:ProcessKeyReply serial=%u context=%u error=%s",
-            reply_serial, pending->context,
-            dbus_error_is_set(&error) ? error.message : "invalid reply");
-        dbus_error_free(&error);
-    }
-    pending->serial = 0;
-}
-
-static void handle_message(DBusMessage *message) {
-    const int type = dbus_message_get_type(message);
-    if (type == DBUS_MESSAGE_TYPE_METHOD_RETURN || type == DBUS_MESSAGE_TYPE_ERROR) {
-        handle_process_key_reply(message, ++next_sequence);
-        return;
-    }
-    if (!dbus_message_has_interface(message, INPUT_CONTEXT_INTERFACE) ||
-        !is_rimworld_message(message))
-        return;
-
-    const char *member = dbus_message_get_member(message);
-    const uint32_t context = context_id(message);
-    if (!member || context == 0) return;
-    const unsigned long long sequence = ++next_sequence;
-    if (dbus_message_get_type(message) == DBUS_MESSAGE_TYPE_METHOD_CALL) {
-        if (strcmp(member, "FocusIn") == 0) {
-            enqueue_message("LOG:FocusIn context=%u", context);
-            enqueue_message("EVENT:%u:%llu:FOCUS:IN", context, sequence);
-        } else if (strcmp(member, "ProcessKeyEvent") == 0) {
-            handle_process_key(message, context, sequence);
-        }
-        return;
-    }
-    if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL) return;
-
-    if (strcmp(member, "CurrentIM") == 0) {
-        DBusError error;
-        dbus_error_init(&error);
-        const char *name = "";
-        const char *unique_name = "";
-        const char *language = "";
-        if (dbus_message_get_args(message, &error,
-                DBUS_TYPE_STRING, &name,
-                DBUS_TYPE_STRING, &unique_name,
-                DBUS_TYPE_STRING, &language,
-                DBUS_TYPE_INVALID)) {
-            if (strcmp(unique_name, "hangul") != 0)
-                cancel_pending_context(context);
-            contexts[context - 1].hangul = strcmp(unique_name, "hangul") == 0;
-            enqueue_message("LOG:CurrentIM context=%u name=%s unique=%s lang=%s",
-                context, name, unique_name, language);
-            enqueue_message("EVENT:%u:%llu:ENGINE:%s", context, sequence, unique_name);
-        } else {
-            enqueue_message("ERROR:CurrentIM context=%u error=%s", context,
-                dbus_error_is_set(&error) ? error.message : "invalid signal");
-            dbus_error_free(&error);
-        }
-    } else if (strcmp(member, "CommitString") == 0) {
-        char text[MAX_TEXT];
-        if (read_string(message, text, sizeof(text))) {
-            enqueue_message("LOG:CommitString context=%u bytes=%zu text=%s",
-                context, strlen(text), text);
-            char prefix[96];
-            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s",
-                context, sequence,
-                contexts[context - 1].hangul ? "HANGUL_COMMIT" : "COMMIT");
-            enqueue_hex(prefix, text);
-        }
-    } else if (strcmp(member, "UpdateFormattedPreedit") == 0) {
-        char text[MAX_TEXT];
-        int32_t cursor = 0;
-        if (read_preedit(message, text, sizeof(text), &cursor)) {
-            enqueue_message("LOG:Preedit context=%u cursor=%d bytes=%zu text=%s",
-                context, cursor, strlen(text), text);
-            char prefix[96];
-            snprintf(prefix, sizeof(prefix), "EVENT:%u:%llu:%s:%d",
-                context, sequence,
-                contexts[context - 1].hangul ? "HANGUL_PREEDIT" : "PREEDIT", cursor);
-            enqueue_hex(prefix, text);
-        } else {
-            enqueue_message("ERROR:Preedit context=%u parse failed", context);
-        }
-    } else if (strcmp(member, "NotifyFocusOut") == 0) {
-        cancel_pending_context(context);
-        enqueue_message("LOG:NotifyFocusOut context=%u", context);
-        enqueue_message("EVENT:%u:%llu:FOCUS:OUT", context, sequence);
-    }
-}
-
-static void close_connection(void) {
-    if (!connection) return;
-    dbus_connection_close(connection);
-    dbus_connection_unref(connection);
-    connection = NULL;
-}
-
-static void *monitor_worker(void *unused) {
-    (void)unused;
-
-    DBusError error;
-    dbus_error_init(&error);
-    connection = dbus_bus_get_private(DBUS_BUS_SESSION, &error);
-    if (!connection) {
-        enqueue_message("ERROR:session bus error=%s",
-            dbus_error_is_set(&error) ? error.message : "unknown");
-        dbus_error_free(&error);
-        goto stopped;
-    }
-    dbus_connection_set_exit_on_disconnect(connection, FALSE);
-
-    if (!discover_rimworld_destinations()) {
-        enqueue_message("ERROR:no D-Bus destination for pid=%u", rimworld_pid);
-        goto stopped;
-    }
-    if (!become_monitor()) goto stopped;
-
-    enqueue_message("READY:%u", rimworld_pid);
-    while (atomic_load_explicit(&running, memory_order_relaxed) &&
-        !atomic_load_explicit(&restart_requested, memory_order_relaxed) &&
-        kill((pid_t)rimworld_pid, 0) == 0) {
-        if (!dbus_connection_read_write(connection, 250)) break;
-        DBusMessage *message;
-        while ((message = dbus_connection_pop_message(connection)) != NULL) {
-            handle_message(message);
-            dbus_message_unref(message);
-        }
-    }
-
-stopped:
-    close_connection();
-    atomic_store_explicit(&running, 0, memory_order_relaxed);
-    enqueue_message("STOPPED");
-    return NULL;
-}
-
-EXPORT void fcitx_bridge_set_debug(int enabled) {
-    const int changed = atomic_exchange_explicit(&debug_logging, enabled != 0,
-        memory_order_relaxed) != (enabled != 0);
-    if (changed && atomic_load_explicit(&running, memory_order_relaxed))
-        atomic_store_explicit(&restart_requested, 1, memory_order_relaxed);
-}
-
-EXPORT int fcitx_bridge_start(uint32_t pid) {
-    pthread_mutex_lock(&state_mutex);
-    if (!dbus_threads_ready) {
-        if (!dbus_threads_init_default()) {
-            pthread_mutex_unlock(&state_mutex);
-            return ENOMEM;
-        }
-        dbus_threads_ready = 1;
-    }
-    if (atomic_load_explicit(&running, memory_order_relaxed)) {
-        pthread_mutex_unlock(&state_mutex);
+/*
+ * action: 0 release, 1 press, 2 repeat. Every key updates the modifier state;
+ * only forwarded keys reach fcitx5. Returns 1 when fcitx5 consumed the key.
+ */
+EXPORT int cjk_key(uint32_t scancode, int action, uint32_t time, int forward) {
+    DBusMessage *reply;
+    DBusMessageIter iter;
+    dbus_bool_t handled = FALSE;
+    dbus_bool_t release = action == 0;
+    uint32_t keycode = scancode + keycode_offset;
+    uint32_t keysym;
+    uint32_t state;
+    if (key_state == NULL)
         return 0;
-    }
-    if (worker_created) {
-        pthread_join(worker_thread, NULL);
-        worker_created = 0;
-    }
+    keysym = xkb_state_key_get_one_sym(key_state, keycode);
+    state = x11_modifiers();
+    if (action != 2)
+        xkb_state_update_key(key_state, keycode, release ? XKB_KEY_UP : XKB_KEY_DOWN);
+    if (!forward || keysym == XKB_KEY_NoSymbol)
+        return 0;
 
-    rimworld_pid = pid;
-    context_count = 0;
-    next_sequence = 0;
-    atomic_store_explicit(&restart_requested, 0, memory_order_relaxed);
-    memset(pending_keys, 0, sizeof(pending_keys));
-    next_pending_key = 0;
-    atomic_store_explicit(&running, 1, memory_order_relaxed);
-    const int result = pthread_create(&worker_thread, NULL, monitor_worker, NULL);
-    if (result == 0) worker_created = 1;
-    else {
-        atomic_store_explicit(&running, 0, memory_order_relaxed);
-        enqueue_message("ERROR:pthread_create result=%d", result);
+    reply = call("ProcessKeyEventBatch", DBUS_TYPE_UINT32, &keysym, DBUS_TYPE_UINT32, &keycode,
+        DBUS_TYPE_UINT32, &state, DBUS_TYPE_BOOLEAN, &release, DBUS_TYPE_UINT32, &time,
+        DBUS_TYPE_INVALID);
+    pump();
+    if (reply == NULL)
+        return 0;
+    if (dbus_message_iter_init(reply, &iter) &&
+        dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_ARRAY) {
+        enqueue_batch(&iter);
+        dbus_message_iter_next(&iter);
+        if (dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_BOOLEAN)
+            dbus_message_iter_get_basic(&iter, &handled);
     }
-    pthread_mutex_unlock(&state_mutex);
-    return result;
+    dbus_message_unref(reply);
+    return handled ? 1 : 0;
 }
 
-EXPORT int fcitx_bridge_poll(char *buffer, int capacity) {
-    if (!buffer || capacity <= 1) return -1;
-
-    pthread_mutex_lock(&queue_mutex);
-    if (atomic_exchange_explicit(&queue_desynced, 0, memory_order_relaxed)) {
-        struct message_node *discarded = queue_head;
-        queue_head = NULL;
-        queue_tail = NULL;
-        queue_count = 0;
-        pthread_mutex_unlock(&queue_mutex);
-        while (discarded) {
-            struct message_node *next = discarded->next;
-            free(discarded->text);
-            free(discarded);
-            discarded = next;
-        }
-        const char reset[] = "EVENT:0:0:RESET:queue-drop";
-        const size_t reset_length = sizeof(reset) - 1;
-        const size_t copy_length = reset_length < (size_t)(capacity - 1)
-            ? reset_length : (size_t)(capacity - 1);
-        memcpy(buffer, reset, copy_length);
-        buffer[copy_length] = '\0';
-        return (int)copy_length;
-    }
-    struct message_node *node = queue_head;
-    if (!node) {
-        pthread_mutex_unlock(&queue_mutex);
+/* Copies the next queued message without a terminator; returns its length or 0. */
+EXPORT int cjk_poll(char *buffer, int capacity) {
+    char *message;
+    int length;
+    if (queue_count == 0)
+        pump();
+    if (queue_count == 0 || capacity <= 0)
         return 0;
-    }
-    queue_head = node->next;
-    if (!queue_head) queue_tail = NULL;
+    message = queue[queue_head];
+    length = (int)strlen(message);
+    if (length > capacity)
+        length = capacity;
+    memcpy(buffer, message, (size_t)length);
+    free(message);
+    queue_head = (queue_head + 1) % MAX_QUEUE_MESSAGES;
     queue_count--;
-    pthread_mutex_unlock(&queue_mutex);
-
-    const size_t length = strlen(node->text);
-    const size_t copy_length = length < (size_t)(capacity - 1)
-        ? length : (size_t)(capacity - 1);
-    memcpy(buffer, node->text, copy_length);
-    buffer[copy_length] = '\0';
-    free(node->text);
-    free(node);
-    return (int)copy_length;
-}
-
-EXPORT int fcitx_bridge_is_running(void) {
-    return atomic_load_explicit(&running, memory_order_relaxed);
-}
-
-EXPORT void fcitx_bridge_stop(void) {
-    pthread_mutex_lock(&state_mutex);
-    atomic_store_explicit(&running, 0, memory_order_relaxed);
-    if (worker_created) {
-        pthread_join(worker_thread, NULL);
-        worker_created = 0;
-    }
-    pthread_mutex_unlock(&state_mutex);
-}
-
-__attribute__((destructor))
-static void stop_bridge_on_unload(void) {
-    fcitx_bridge_stop();
+    return length;
 }

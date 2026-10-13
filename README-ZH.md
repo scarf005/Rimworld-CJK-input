@@ -29,11 +29,13 @@ ldconfig -p | grep libdbus-1.so.3
         libdbus-1.so.3 (libc6) => /lib/libdbus-1.so.3
 ```
 
-### 2. Steam 中右键 RimWorld > 点击 `属性`
+RimWorld 1.7 测试版还会用到 `libxkbcommon`、`libwayland-client`（Wayland 会话）与 `fc-match`（fontconfig），大多数桌面发行版已默认安装。
+
+### 2.（仅 1.6）Steam 中右键 RimWorld > 点击 `属性`
 
 ![](./assets/properties-zh.webp)
 
-### 3. 在 `启动选项` 中粘贴以下内容
+### 3.（仅 1.6）在 `启动选项` 中粘贴以下内容
 
 ![](./assets/settings-zh.webp)
 
@@ -43,7 +45,18 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 ### 4. 在设置中启用 `Fcitx CJK Input` mod
 
-## 工作原理
+## 工作原理（1.7）
+
+RimWorld 1.7 使用 GLFW，不支持 Wayland 文本输入协议，fcitx5 收不到按键。本 mod 会：
+
+1. 通过 `1.7/Assemblies/libfcitxcjkinput.so` 自行创建 fcitx5 D-Bus 输入上下文。
+2. 文本框获得焦点时把 GLFW 按键转发给 fcitx5，fcitx5 处理过的按键不再交给游戏。
+3. 将提交内容放入游戏文本输入队列，在文本框内绘制预编辑文字，在其下方绘制候选列表。
+4. 游戏的固定字体路径中没有 CJK 字体时，将 fontconfig 选出的 CJK 字体合并进界面字体。
+
+键盘布局只在启动时读取一次，切换布局后需重启游戏。**Debug log** 会把 fcitx5 事件写入游戏日志。
+
+## 工作原理（1.6）
 
 Unity 2022 会创建 SDL2 fcitx5 输入上下文，但不会把 Linux IME 的提交内容连接到 IMGUI 文本框。本 mod 会做以下事情：
 
@@ -67,14 +80,14 @@ just build
 just install
 ```
 
-`just build` 会生成以下文件：
+`just build` 会生成以下文件。1.6 版本使用 `rimworld-1.6` 分支、`just prepare` 下载的 Harmony 以及 `RIMWORLD_1_6_DIR` 中的 1.6 安装目录构建。
 
 ```text
 1.6/Assemblies/FcitxCjkInput.dll
 1.6/Assemblies/libfcitxcjkinput.so
+1.7/Assemblies/FcitxCjkInput.dll
+1.7/Assemblies/libfcitxcjkinput.so
 ```
-
-原生库动态链接系统自带的 `libdbus-1.so.3`。
 
 ## 许可证
 

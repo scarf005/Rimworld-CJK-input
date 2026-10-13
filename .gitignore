@@ -36,6 +36,8 @@ packages/
 # Built assemblies (CI-built, not tracked)
 1.6/Assemblies/*.dll
 1.6/Assemblies/*.so
+1.7/Assemblies/*.dll
+1.7/Assemblies/*.so
 
 # Rust build artifacts
 native-rs/target/

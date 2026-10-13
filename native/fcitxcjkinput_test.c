@@ -1,164 +1,94 @@
+/*
+ * Integration test against the running fcitx5 session. Requires fcitx5-hangul
+ * as an input method and a keymap where Right Alt or the Hangul key emits the
+ * Hangul keysym (for example `kr` with `korean:ralt_hangul`).
+ */
+
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "fcitxcjkinput.c"
 
-#define CLIENT ":1.42"
+#define KEY_G 34
+#define KEY_K 37
+#define KEY_S 31
+#define KEY_R 19
+#define KEY_M 50
+#define KEY_F 33
+#define KEY_SPACE 57
+#define KEY_RIGHTALT 100
+#define KEY_HANGEUL 122
 
-static DBusMessage *key_message(uint32_t keyval, dbus_bool_t release,
-    uint32_t serial) {
-    DBusMessage *message = dbus_message_new_method_call(
-        "org.fcitx.Fcitx5", "/inputcontext_1", INPUT_CONTEXT_INTERFACE,
-        "ProcessKeyEvent");
-    assert(message);
-    assert(dbus_message_set_sender(message, CLIENT));
-    dbus_message_set_serial(message, serial);
-    uint32_t keycode = 25;
-    uint32_t state = 0;
-    uint32_t time = 0;
-    assert(dbus_message_append_args(message,
-        DBUS_TYPE_UINT32, &keyval,
-        DBUS_TYPE_UINT32, &keycode,
-        DBUS_TYPE_UINT32, &state,
-        DBUS_TYPE_BOOLEAN, &release,
-        DBUS_TYPE_UINT32, &time,
-        DBUS_TYPE_INVALID));
-    return message;
+static char commits[MAX_TEXT];
+static char preedit[MAX_TEXT];
+
+static void drain(void) {
+    char buffer[MAX_MESSAGE + 1];
+    int length;
+    while ((length = cjk_poll(buffer, MAX_MESSAGE)) > 0) {
+        buffer[length] = '\0';
+        if (strncmp(buffer, "commit" SEPARATOR, 7) == 0)
+            append(commits, sizeof commits, buffer + 7);
+        else if (strncmp(buffer, "preedit" SEPARATOR, 8) == 0)
+            snprintf(preedit, sizeof preedit, "%s", strchr(buffer + 8, '\x1f') + 1);
+    }
 }
 
-static void handle_key(uint32_t keyval, dbus_bool_t release,
-    uint32_t serial, unsigned long long sequence) {
-    DBusMessage *message = key_message(keyval, release, serial);
-    handle_process_key(message, 1, sequence);
-    dbus_message_unref(message);
+static int tap(uint32_t scancode) {
+    int handled = cjk_key(scancode, 1, 0, 1);
+    cjk_key(scancode, 0, 0, 1);
+    drain();
+    return handled;
 }
 
-static void handle_reply(uint32_t serial, dbus_bool_t accepted,
-    unsigned long long sequence) {
-    DBusMessage *message = dbus_message_new(DBUS_MESSAGE_TYPE_METHOD_RETURN);
-    assert(message);
-    assert(dbus_message_set_destination(message, CLIENT));
-    dbus_message_set_reply_serial(message, serial);
-    assert(dbus_message_append_args(message,
-        DBUS_TYPE_BOOLEAN, &accepted,
-        DBUS_TYPE_INVALID));
-    handle_process_key_reply(message, sequence);
-    dbus_message_unref(message);
-}
-
-static void handle_commit(const char *text) {
-    DBusMessage *message = dbus_message_new_signal(
-        "/inputcontext_1", INPUT_CONTEXT_INTERFACE, "CommitString");
-    assert(message);
-    assert(dbus_message_set_destination(message, CLIENT));
-    assert(dbus_message_append_args(message,
-        DBUS_TYPE_STRING, &text,
-        DBUS_TYPE_INVALID));
-    handle_message(message);
-    dbus_message_unref(message);
-}
-
-static void expect_message(const char *expected) {
-    char buffer[256];
-    const int length = fcitx_bridge_poll(buffer, sizeof(buffer));
-    assert(length > 0);
-    assert(strcmp(buffer, expected) == 0);
-}
-
-static void expect_key_message(uint32_t expected_context,
-    unsigned long long expected_sequence, uint32_t expected_keyval,
-    int expected_release) {
-    char buffer[256];
-    const int length = fcitx_bridge_poll(buffer, sizeof(buffer));
-    assert(length > 0);
-    uint32_t context = 0;
-    unsigned long long sequence = 0;
-    uint32_t keyval = 0;
-    int release = 0;
-    unsigned long long observed_at_ms = 0;
-    assert(sscanf(buffer, "EVENT:%u:%llu:KEY:%u:%d:%llu", &context, &sequence,
-        &keyval, &release, &observed_at_ms) == 5);
-    assert(context == expected_context);
-    assert(sequence == expected_sequence);
-    assert(keyval == expected_keyval);
-    assert(release == expected_release);
-    assert(observed_at_ms > 0);
-}
-
-static void expect_no_message(void) {
-    char buffer[256];
-    assert(fcitx_bridge_poll(buffer, sizeof(buffer)) == 0);
+static uint32_t hangul_toggle(void) {
+    uint32_t candidates[] = { KEY_HANGEUL, KEY_RIGHTALT };
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
+        if (xkb_state_key_get_one_sym(key_state, candidates[i] + keycode_offset) == XKB_KEY_Hangul)
+            return candidates[i];
+    }
+    return 0;
 }
 
 int main(void) {
-    atomic_store_explicit(&debug_logging, 0, memory_order_relaxed);
-    contexts[0].hangul = 1;
-    snprintf(contexts[0].destination, sizeof(contexts[0].destination), "%s", CLIENT);
-    snprintf(contexts[0].path, sizeof(contexts[0].path), "%s", "/inputcontext_1");
-    context_count = 1;
-    rimworld_destination_count = 1;
-    snprintf(rimworld_destinations[0], sizeof(rimworld_destinations[0]), "%s", CLIENT);
+    uint32_t toggle;
+    int toggled = 0;
+    assert(cjk_start() == 0);
+    toggle = hangul_toggle();
+    assert(toggle != 0 && "no key emits the Hangul keysym");
+    cjk_focus(1);
 
-    handle_key('w', FALSE, 7, 7);
-    expect_no_message();
-    handle_reply(7, TRUE, 8);
-    expect_key_message(1, 8, 'w', 0);
-    handle_key('w', TRUE, 9, 9);
-    expect_key_message(1, 9, 'w', 1);
+    /* A fresh context may start in either state; switch until g composes. */
+    tap(KEY_G);
+    if (preedit[0] == '\0') {
+        cjk_reset();
+        drain();
+        tap(toggle);
+        toggled = 1;
+        commits[0] = '\0';
+        tap(KEY_G);
+    }
+    assert(strcmp(preedit, "ㅎ") == 0);
 
-    handle_key('q', FALSE, 10, 10);
-    expect_no_message();
-    handle_reply(10, TRUE, 11);
-    expect_key_message(1, 11, 'q', 0);
+    assert(tap(KEY_K) == 1);
+    assert(tap(KEY_S) == 1);
+    assert(tap(KEY_R) == 1);
+    assert(strcmp(commits, "한") == 0);
+    assert(strcmp(preedit, "ㄱ") == 0);
+    assert(tap(KEY_M) == 1);
+    assert(tap(KEY_F) == 1);
+    assert(strcmp(preedit, "글") == 0);
 
-    handle_key('e', FALSE, 12, 12);
-    handle_reply(12, FALSE, 13);
-    expect_no_message();
+    /* Space commits the syllable first and stays with the game. */
+    assert(tap(KEY_SPACE) == 0);
+    assert(strcmp(commits, "한글") == 0);
+    assert(preedit[0] == '\0');
 
-    handle_key('z', FALSE, 14, 14);
-    handle_key('z', TRUE, 15, 15);
-    expect_key_message(1, 15, 'z', 1);
-    handle_reply(14, TRUE, 16);
-    expect_no_message();
-
-    handle_key('q', FALSE, 17, 17);
-    handle_key('q', FALSE, 18, 18);
-    handle_reply(17, TRUE, 19);
-    expect_key_message(1, 19, 'q', 0);
-    handle_reply(18, TRUE, 20);
-    expect_key_message(1, 20, 'q', 0);
-
-    handle_key('W', FALSE, 21, 21);
-    handle_key('w', TRUE, 22, 22);
-    expect_key_message(1, 22, 'w', 1);
-    handle_reply(21, TRUE, 23);
-    expect_no_message();
-
-    handle_key('q', FALSE, 24, 24);
-    cancel_pending_context(1);
-    handle_reply(24, TRUE, 25);
-    expect_no_message();
-
-    handle_key('r', FALSE, 26, 26);
-    expect_no_message();
-
-    contexts[0].hangul = 0;
-    handle_key('a', FALSE, 27, 27);
-    expect_no_message();
-
-    atomic_store_explicit(&queue_desynced, 1, memory_order_relaxed);
-    enqueue_message("EVENT:1:28:KEYRESET:pending-overflow");
-    expect_message("EVENT:0:0:RESET:queue-drop");
-    expect_no_message();
-
-    for (size_t i = 0; i <= MAX_QUEUE_MESSAGES; i++)
-        enqueue_message("EVENT:1:%zu:KEYRESET:queue-limit", i);
-    expect_message("EVENT:0:0:RESET:queue-drop");
-    expect_no_message();
-
-    contexts[0].hangul = 1;
-    next_sequence = 30;
-    handle_commit("가");
-    expect_message("EVENT:1:31:HANGUL_COMMIT:EAB080");
+    if (toggled)
+        tap(toggle);
+    cjk_focus(0);
+    cjk_stop();
+    puts("PASS hangul composition through fcitx5 batch events");
     return 0;
 }

@@ -6,6 +6,7 @@
   <packageId>scarf.cjkinput</packageId>
   <supportedVersions>
     <li>1.6</li>
+    <li>1.7</li>
   </supportedVersions>
   <loadAfter>
     <li>Ludeon.RimWorld</li>
@@ -25,43 +26,46 @@
 1. 바이브 코딩으로 만들어진 프로그램이므로 사용에 유의하십시오.
 2. 불완전하게 지원하기 때문에 잔버그가 있습니다. 보통 한영키 변경 시 해결 가능합니다.
 
-Steam 시작 옵션:
+Steam 시작 옵션 (1.6만 해당, 1.7은 필요 없음):
 XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 요구 사항:
-- 네이티브 Linux RimWorld 1.6
+- 네이티브 Linux RimWorld 1.6 또는 1.7 베타
 - Harmony
 - fcitx5
 - libdbus-1.so.3
+- 1.7: libxkbcommon, libwayland-client, fontconfig
 
 소스 코드: https://github.com/scarf005/Rimworld-CJK-input
 
 Fcitx5 CJK input support for RimWorld on Linux.
 
-Connects Unity's native SDL2/fcitx5 input context to RimWorld IMGUI text fields.
-Supports physical IME toggle keys, preedit text, commits, and cursor placement.
+On 1.6, connects Unity's native SDL2/fcitx5 input context to RimWorld IMGUI text fields.
+On 1.7, routes text-field keys through its own fcitx5 input context and draws preedit and candidates.
 
 WARNING: ENTIRELY VIBE CODED, USE AT YOUR OWN RISK
 
-Steam launch options:
+Steam launch options (1.6 only, not needed on 1.7):
 XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 Requirements:
-- Native Linux RimWorld 1.6
+- Native Linux RimWorld 1.6 or 1.7 beta
 - Harmony
 - fcitx5
 - libdbus-1.so.3
+- 1.7: libxkbcommon, libwayland-client, fontconfig
 
 RimWorld Linux 版的 fcitx5 中文（及韩文）输入支持。
 
 注意事项：这是一个通过 vibe coding 编写的程序，使用时请自行承担风险。输入支持尚不完整，存在一些小问题，通常切换中英文后即可解决。
 
-Steam 启动选项：
+Steam 启动选项（仅 1.6，1.7 无需设置）：
 XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 
 要求：
-- 原生 Linux RimWorld 1.6
+- 原生 Linux RimWorld 1.6 或 1.7 测试版
 - Harmony
 - fcitx5
-- libdbus-1.so.3]]></description>
+- libdbus-1.so.3
+- 1.7：libxkbcommon、libwayland-client、fontconfig]]></description>
 </ModMetaData>
