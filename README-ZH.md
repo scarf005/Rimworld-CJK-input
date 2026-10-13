@@ -29,7 +29,7 @@ ldconfig -p | grep libdbus-1.so.3
         libdbus-1.so.3 (libc6) => /lib/libdbus-1.so.3
 ```
 
-RimWorld 1.7 测试版还会用到 `libxkbcommon` 与 `libwayland-client`（Wayland 会话），大多数桌面发行版已默认安装。
+RimWorld 1.7 测试版还会用到 `libxkbcommon`、`libwayland-client`（Wayland 会话）与 `fc-match`（fontconfig），大多数桌面发行版已默认安装。
 
 ### 2.（仅 1.6）Steam 中右键 RimWorld > 点击 `属性`
 
@@ -52,6 +52,7 @@ RimWorld 1.7 使用 GLFW，不支持 Wayland 文本输入协议，fcitx5 收不�
 1. 通过 `1.7/Assemblies/libfcitxcjkinput.so` 自行创建 fcitx5 D-Bus 输入上下文。
 2. 文本框获得焦点时把 GLFW 按键转发给 fcitx5，fcitx5 处理过的按键不再交给游戏。
 3. 将提交内容放入游戏文本输入队列，在文本框内绘制预编辑文字，在其下方绘制候选列表。
+4. 游戏的固定字体路径中没有 CJK 字体时，将 fontconfig 选出的 CJK 字体合并进界面字体。
 
 键盘布局只在启动时读取一次，切换布局后需重启游戏。**Debug log** 会把 fcitx5 事件写入游戏日志。
 

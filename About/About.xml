@@ -34,7 +34,7 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 - Harmony
 - fcitx5
 - libdbus-1.so.3
-- 1.7: libxkbcommon, libwayland-client
+- 1.7: libxkbcommon, libwayland-client, fontconfig
 
 소스 코드: https://github.com/scarf005/Rimworld-CJK-input
 
@@ -53,7 +53,7 @@ Requirements:
 - Harmony
 - fcitx5
 - libdbus-1.so.3
-- 1.7: libxkbcommon, libwayland-client
+- 1.7: libxkbcommon, libwayland-client, fontconfig
 
 RimWorld Linux 版的 fcitx5 中文（及韩文）输入支持。
 
@@ -67,5 +67,5 @@ XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 - Harmony
 - fcitx5
 - libdbus-1.so.3
-- 1.7：libxkbcommon、libwayland-client]]></description>
+- 1.7：libxkbcommon、libwayland-client、fontconfig]]></description>
 </ModMetaData>
