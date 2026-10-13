@@ -12,6 +12,7 @@ env:
   SOLUTION_FILE: Source/FcitxCjkInput/FcitxCjkInput.csproj
   ASSEMBLY_DIR: 1.6/Assemblies
   RIMWORLD_REF: /tmp/rimworld-refs
+  RIMWORLD_17_REF: /tmp/rimworld-1.7-refs
 
 jobs:
   build:
@@ -21,12 +22,20 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: check RimWorld 1.7 references
+        run: |
+          test -f "$RIMWORLD_17_REF/UnityStubs.dll" || {
+            echo "::error::RimWorld 1.7 reference assemblies are not publicly available; release locally with 'just build'."
+            exit 1
+          }
 
       - name: install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            gcc libdbus-1-dev pkg-config p7zip-full curl lib32gcc-s1 steamcmd
+            gcc libdbus-1-dev libxkbcommon-dev libwayland-dev pkg-config p7zip-full curl lib32gcc-s1 steamcmd
 
       - name: cache RimWorld assemblies
         id: cache-rw
@@ -48,34 +57,46 @@ jobs:
           curl -sLO https://github.com/pardeike/HarmonyRimWorld/releases/latest/download/HarmonyMod.zip
           7z x -y HarmonyMod.zip -opackages
 
-      - name: build native bridge (.so)
-        run: |
-          mkdir -p "$ASSEMBLY_DIR"
-          gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
-            -o "$ASSEMBLY_DIR/libfcitxcjkinput.so" \
-            native/fcitxcjkinput.c \
-            $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
-
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: '10.0.x'
 
-      - name: build mod assembly (.dll)
+      - name: build RimWorld 1.6 bridge and assembly
         run: |
-          dotnet build "$SOLUTION_FILE" -c Release \
+          mkdir -p Source/obj/rimworld-1.6 "$ASSEMBLY_DIR"
+          git archive origin/rimworld-1.6 Source native | tar -x -C Source/obj/rimworld-1.6
+          ln -sfn "$PWD/packages" Source/obj/rimworld-1.6/packages
+          gcc -shared -fPIC -fvisibility=hidden -pthread -Wl,-soname,libfcitxcjkinput.so \
+            -o "$ASSEMBLY_DIR/libfcitxcjkinput.so" \
+            Source/obj/rimworld-1.6/native/fcitxcjkinput.c \
+            $(pkg-config --cflags --libs dbus-1) -Wall -Wextra -O2
+          dotnet build Source/obj/rimworld-1.6/$SOLUTION_FILE -c Release \
             -p:STEAM_APPS="$RIMWORLD_REF" \
-            -p:STEAM_OS="RimWorldLinux_Data"
+            -p:STEAM_OS="RimWorldLinux_Data" \
+            -p:OutputPath="$PWD/$ASSEMBLY_DIR/"
+
+      - name: build RimWorld 1.7 bridge and assembly
+        run: |
+          mkdir -p 1.7/Assemblies
+          gcc -shared -fPIC -fvisibility=hidden -Wl,-soname,libfcitxcjkinput.so \
+            -o 1.7/Assemblies/libfcitxcjkinput.so native/fcitxcjkinput.c \
+            $(pkg-config --cflags --libs dbus-1 xkbcommon wayland-client) -Wall -Wextra -Werror -O2
+          dotnet run --project Source/FcitxCjkInput.Tests/FcitxCjkInput.Tests.csproj -c Release
+          dotnet build "$SOLUTION_FILE" -c Release -p:RIMWORLD_DIR="$RIMWORLD_17_REF"
 
       - name: verify built artifacts
         run: |
-          ls -la "$ASSEMBLY_DIR/"
-          test -f "$ASSEMBLY_DIR/FcitxCjkInput.dll"
-          test -f "$ASSEMBLY_DIR/libfcitxcjkinput.so"
+          for dir in "$ASSEMBLY_DIR" 1.7/Assemblies; do
+            test -f "$dir/FcitxCjkInput.dll"
+            test -f "$dir/libfcitxcjkinput.so"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MOD_PACKAGE_ID }}-${{ github.ref_name }}
-          path: ${{ env.ASSEMBLY_DIR }}/
+          path: |
+            ${{ env.ASSEMBLY_DIR }}/
+            1.7/Assemblies/
 
   package:
     needs: build
@@ -86,18 +107,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ${{ env.MOD_PACKAGE_ID }}-${{ github.ref_name }}
-          path: ${{ env.ASSEMBLY_DIR }}
 
       - name: create mod archive
         run: |
           pkg="$MOD_PACKAGE_ID"
-          ver="$RIMWORLD_VERSION"
-          mkdir -p "dist/$pkg/$ver/Assemblies"
+          mkdir -p "dist/$pkg"
           # metadata
           cp -r About "dist/$pkg/"
           # assemblies
-          cp "$ASSEMBLY_DIR"/*.dll "$ASSEMBLY_DIR"/*.so \
-            "dist/$pkg/$ver/Assemblies/" 2>/dev/null || true
+          for ver in 1.6 1.7; do
+            mkdir -p "dist/$pkg/$ver"
+            cp -r "$ver/Assemblies" "dist/$pkg/$ver/"
+          done
           # optional mod directories
           for dir in Defs Languages Patches Textures; do
             [ -d "$dir" ] && cp -r "$dir" "dist/$pkg/"
