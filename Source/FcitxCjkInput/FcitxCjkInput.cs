@@ -94,6 +94,8 @@ internal static class FcitxCjkInputMod {
         harmony.Patch(AccessTools.Method(bridge, "OnFocus"), prefix: new HarmonyMethod(BeforeWindowFocus));
         harmony.Patch(AccessTools.Method(typeof(GUI), "DrawTextFieldChrome"),
             prefix: new HarmonyMethod(BeforeDrawField), postfix: new HarmonyMethod(AfterDrawField));
+        harmony.Patch(AccessTools.Method("RimWorldWaylith.Imgui.ImGuiHost:BeginFrame"),
+            prefix: new HarmonyMethod(CjkFontFallback.BeforeFrame));
     }
 
     /// <summary>Forwards keys to fcitx5 while a text field is focused and skips the ones it consumes.</summary>
