@@ -1,79 +1,113 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Brutal.ImGuiApi;
+using Brutal.Pointers;
 using HarmonyLib;
-using UnityEngine;
 using Verse;
 
 namespace FcitxCjkInput;
 
 /// <summary>
-/// RimWorld 1.7 merges CJK fallback fonts only from a fixed list of distribution paths
-/// (RimWorldWaylith.Imgui.FontFallbacks), so CJK text renders as boxes elsewhere, e.g. on Fedora.
-/// Merges the fonts fontconfig picks for CJK languages into every loaded UI font.
+/// RimWorld 1.7 picks CJK fallback fonts by fixed file names (RimWorldWaylith.Imgui.FontFallbacks),
+/// so CJK text renders as boxes when only other files exist, e.g. Fedora's default NotoSansCJK-VF.ttc.
+/// Adds the fonts fontconfig picks for CJK languages to the engine's fallback list.
 /// </summary>
 internal static class CjkFontFallback {
-    private static readonly string[] Languages = ["ko", "zh-cn", "ja"];
     private static readonly string[] KnownCjkFonts = ["CJK", "Nanum", "DroidSansFallback", "wqy"];
+    private static readonly Type Fallbacks = AccessTools.TypeByName("RimWorldWaylith.Imgui.FontFallbacks");
+    private static readonly Type Source = AccessTools.Inner(Fallbacks, "Source");
+    private static readonly uint[] HanRanges = (uint[])AccessTools.Field(Fallbacks, "HanRanges").GetValue(null)!;
 
     private static bool applied;
 
-    /// <summary>Prefix of ImGuiHost.BeginFrame: merges once between frames, before ImGui.NewFrame.</summary>
-    internal static void BeforeFrame(object __instance) {
+    internal static void Patch(Harmony harmony) {
+        harmony.Patch(AccessTools.Method(Fallbacks, "Resolve"), postfix: new HarmonyMethod(AfterResolve));
+        harmony.Patch(AccessTools.Method("RimWorldWaylith.Imgui.ImGuiHost:BeginFrame"), prefix: new HarmonyMethod(BeforeFrame));
+    }
+
+    /// <summary>Postfix of FontFallbacks.Resolve: inserts fontconfig's CJK fonts after the script-excluding symbol fonts.</summary>
+    private static void AfterResolve(string? locale, object __result) {
+        var sources = (IList)__result;
+        if (HasCjk(sources)) {
+            return;
+        }
+
+        var at = sources.Cast<object>().TakeWhile(source => Field(source, "ExcludeRanges") != null).Count();
+        foreach (var (path, fontNo, excludeRanges) in Enumerable.Reverse(Fonts(locale))) {
+            sources.Insert(at, Activator.CreateInstance(Source, path, fontNo, excludeRanges));
+        }
+    }
+
+    /// <summary>Prefix of ImGuiHost.BeginFrame: fixes fonts built before this mod loaded, once between frames.</summary>
+    private static void BeforeFrame(object __instance) {
         if (applied) {
             return;
         }
 
         applied = true;
-        Apply(__instance);
+        try {
+            Rebuild(__instance);
+        } catch (Exception exception) {
+            Log.Error($"[CJK] CJK font fallback failed: {exception}");
+        }
     }
 
-    private static void Apply(object host) {
-        var hostType = host.GetType();
-        var fallbackField = AccessTools.Field(hostType, "fallbackFonts");
-        var fallbacks = (IReadOnlyList<string>)fallbackField.GetValue(host)!;
-        if (fallbacks.Any(path => KnownCjkFonts.Any(name => path.Contains(name, StringComparison.OrdinalIgnoreCase)))) {
+    private static void Rebuild(object host) {
+        var byLocale = (IDictionary)Traverse.Create(host).Field("fallbacksByLocale").GetValue();
+        if (byLocale.Values.Cast<IList>().Any(HasCjk)) {
             return;
         }
 
-        var added = Languages.Select(FontFor).OfType<string>().Distinct().Except(fallbacks).ToList();
-        if (added.Count == 0) {
+        var fonts = Fonts(null);
+        if (fonts.Count == 0) {
             Log.Warning("[CJK] fontconfig found no CJK font; CJK text renders as boxes");
             return;
         }
 
-        // Fonts loaded later (registered and bold/italic variants) read this list.
-        fallbackField.SetValue(host, fallbacks.Concat(added).ToList());
-        ImGui.SetCurrentContext((ImGuiContextPtr)AccessTools.Field(hostType, "context").GetValue(host)!);
-        var fonts = (List<ImFontPtr>)AccessTools.Field(hostType, "fonts").GetValue(host)!;
-        var sizes = (List<float>)AccessTools.Field(hostType, "importSizes").GetValue(host)!;
-        var styled = (Dictionary<(int, FontStyle), ImFontPtr>)AccessTools.Field(hostType, "styledFonts").GetValue(host)!;
-        var targets = fonts.Select((font, i) => (font, sizes[i], 0u))
-            .Concat(styled.Select(pair => (pair.Value, sizes[pair.Key.Item1], StyleFlags(pair.Key.Item2))));
-        foreach (var (font, size, styleFlags) in targets) {
+        // Locale and styled fonts are rebuilt lazily from the patched fallbacks; base fonts are merged in place.
+        byLocale.Clear();
+        Traverse.Create(host).Field<IDictionary>("localeFonts").Value.Clear();
+        Traverse.Create(host).Field<IDictionary>("styledFonts").Value.Clear();
+        var sizes = Traverse.Create(host).Field<List<float>>("importSizes").Value;
+        foreach (var (font, size) in Traverse.Create(host).Field<List<ImFontPtr>>("fonts").Value.Zip(sizes)) {
             // Existing bakes hold loader data per source; discard them while the source count still matches.
             font.ClearOutputData();
-            foreach (var path in added) {
-                Merge(font, path, size, styleFlags);
+            foreach (var (path, fontNo, excludeRanges) in fonts) {
+                Merge(font, path, fontNo, excludeRanges, size);
             }
         }
 
-        Log.Message($"[CJK] merged CJK fallback fonts: {string.Join(", ", added)}");
+        Traverse.Create(host).Field<int>("fontGeneration").Value++;
+        Log.Message($"[CJK] merged CJK fallback fonts: {string.Join(", ", fonts.Select(font => $"{font.Path}#{font.FontNo}"))}");
     }
 
-    private static uint StyleFlags(FontStyle style) =>
-        ((style & FontStyle.Bold) != 0 ? 0x20u : 0u) | ((style & FontStyle.Italic) != 0 ? 0x40u : 0u);
+    private static bool HasCjk(IList sources) =>
+        sources.Cast<object>().Any(source => KnownCjkFonts.Any(name => ((string)Field(source, "Path")!).Contains(name, StringComparison.OrdinalIgnoreCase)));
 
-    private static string? FontFor(string language) {
+    private static object? Field(object source, string name) => Traverse.Create(source).Property(name).GetValue();
+
+    /// <summary>Mirrors FontFallbacks.Resolve: a Hangul font with Han excluded, then the locale's Han font.</summary>
+    private static List<(string Path, uint FontNo, uint[]? ExcludeRanges)> Fonts(string? locale) {
+        var hangul = FontFor("ko");
+        var han = FontFor(locale switch { "KR" => "ko", "SC" => "zh-cn", "TC" => "zh-tw", _ => "ja" });
+        return [
+            .. hangul is var (hangulPath, hangulNo) ? [(hangulPath, hangulNo, HanRanges)] : Array.Empty<(string, uint, uint[]?)>(),
+            .. han is var (hanPath, hanNo) ? [(hanPath, hanNo, null)] : Array.Empty<(string, uint, uint[]?)>(),
+        ];
+    }
+
+    private static (string Path, uint FontNo)? FontFor(string language) {
         try {
-            using var process = Process.Start(new ProcessStartInfo("fc-match", ["--format=%{file}", $"sans-serif:lang={language}"]) {
+            using var process = Process.Start(new ProcessStartInfo("fc-match", ["--format=%{file}\t%{index}", $"sans-serif:lang={language}"]) {
                 RedirectStandardOutput = true,
             });
-            var path = process?.StandardOutput.ReadToEnd().Trim();
+            var output = process?.StandardOutput.ReadToEnd().Trim().Split('\t');
             process?.WaitForExit();
-            return string.IsNullOrEmpty(path) ? null : path;
+            return output is [{ Length: > 0 } path, var index] && uint.TryParse(index, out var fontNo) ? (path, fontNo) : null;
         } catch (Exception exception) {
             Log.Warning($"[CJK] fc-match failed: {exception.Message}");
             return null;
@@ -81,17 +115,22 @@ internal static class CjkFontFallback {
     }
 
     /// <summary>Mirrors ImGuiHost.AddFallbacks, targeting an already loaded font.</summary>
-    private static unsafe void Merge(ImFontPtr font, string path, float size, uint styleFlags) {
+    private static unsafe void Merge(ImFontPtr font, string path, uint fontNo, uint[]? excludeRanges, float size) {
         var config = new ImFontConfig {
             FontDataOwnedByAtlas = true,
             GlyphMaxAdvanceX = float.MaxValue,
             RasterizerMultiply = 1f,
             RasterizerDensity = 1f,
-            FontLoaderFlags = 0x200 | styleFlags,
+            FontLoaderFlags = 0x200,
             PixelSnapH = true,
             MergeMode = true,
+            FontNo = fontNo,
             DstFont = font,
         };
+        if (excludeRanges != null) {
+            config.GlyphExcludeRanges = new Ptr<uint>((uint*)Marshal.UnsafeAddrOfPinnedArrayElement(excludeRanges, 0));
+        }
+
         ImGui.GetIO().Fonts.AddFontFromFileTTF(path, size, new ImFontConfigPtr(&config));
     }
 }
