@@ -25,6 +25,7 @@ internal static class FcitxCjkInputMod {
 
     private static readonly byte[] Buffer = new byte[16384];
     private static readonly List<Action> heldButtons = [];
+    private static readonly HashSet<int> consumedPresses = [];
 
     private static bool contextFocused;
     private static int focusedControl;
@@ -102,14 +103,29 @@ internal static class FcitxCjkInputMod {
         }
     }
 
-    /// <summary>Forwards keys to fcitx5 while a text field is focused and skips the ones it consumes.</summary>
-    private static bool BeforeKey(int scancode, GlfwKeyAction action) {
+    /// <summary>
+    /// Forwards keys to fcitx5 while a text field is focused and skips the ones it consumes. The game drops
+    /// repeats of a press it never saw, so a key held past the composition, such as Backspace, becomes a press.
+    /// </summary>
+    private static bool BeforeKey(int scancode, ref GlfwKeyAction action) {
         SyncFocus();
         var forward = contextFocused && FieldActive;
         var handled = cjk_key((uint)scancode, (int)action, (uint)Environment.TickCount, forward ? 1 : 0) == 1;
         Drain();
         swallowChars = handled && action != GlfwKeyAction.Release;
-        return !swallowChars;
+        if (swallowChars) {
+            if (action == GlfwKeyAction.Press) {
+                consumedPresses.Add(scancode);
+            }
+
+            return false;
+        }
+
+        if (consumedPresses.Remove(scancode) && action == GlfwKeyAction.Repeat) {
+            action = GlfwKeyAction.Press;
+        }
+
+        return true;
     }
 
     /// <summary>GLFW reports a key's character right after the key; drop it when fcitx5 consumed the key.</summary>
