@@ -101,14 +101,16 @@ internal static class CjkFontFallback {
         ];
     }
 
+    /// <summary>fc-match falls back to its closest font, so a match must also cover the language.</summary>
     private static (string Path, uint FontNo)? FontFor(string language) {
         try {
-            using var process = Process.Start(new ProcessStartInfo("fc-match", ["--format=%{file}\t%{index}", $"sans-serif:lang={language}"]) {
+            using var process = Process.Start(new ProcessStartInfo("fc-match", ["--format=%{file}\t%{index}\t%{lang}", $"sans-serif:lang={language}"]) {
                 RedirectStandardOutput = true,
             });
             var output = process?.StandardOutput.ReadToEnd().Trim().Split('\t');
             process?.WaitForExit();
-            return output is [{ Length: > 0 } path, var index] && uint.TryParse(index, out var fontNo) ? (path, fontNo) : null;
+            return output is [{ Length: > 0 } path, var index, var languages] && languages.Split('|').Contains(language)
+                && uint.TryParse(index, out var fontNo) ? (path, fontNo) : null;
         } catch (Exception exception) {
             Log.Warning($"[CJK] fc-match failed: {exception.Message}");
             return null;
