@@ -189,9 +189,11 @@ internal static class FcitxCjkInputMod {
     private static void DrawPanel(Panel visible) {
         string[] lines = visible.Header.Length > 0 ? [visible.Header, .. visible.Candidates] : [.. visible.Candidates];
         var offset = visible.Header.Length > 0 ? 1 : 0;
+        var font = Text.Font;
         Text.Font = GameFont.Small;
         var lineHeight = Text.LineHeight;
         var width = lines.Max(line => Text.CalcSize(line).x) + 16f;
+        Text.Font = font;
         var height = lineHeight * lines.Length + 8f;
         var below = fieldRect.yMax + 2f;
         var rect = new Rect(Mathf.Min(fieldRect.x, UI.screenWidth - width),
