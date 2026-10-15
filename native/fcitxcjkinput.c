@@ -7,7 +7,7 @@
  * key events while a text field is focused.
  *
  * Public API:
- *   int cjk_start(void)
+ *   int cjk_start(int evdev_scancodes)
  *   void cjk_stop(void)
  *   void cjk_focus(int focused)
  *   void cjk_reset(void)
@@ -153,7 +153,7 @@ static const struct wl_registry_listener registry_listener = {
     registry_global, registry_global_remove,
 };
 
-/* GLFW reports evdev scancodes on Wayland and X11 keycodes on X11. */
+/* Prefers the compositor's keymap, whose keycodes are evdev + 8 like X11's. */
 static void load_keymap(void) {
     struct wl_display *display = getenv("WAYLAND_DISPLAY") ? wl_display_connect(NULL) : NULL;
     if (display != NULL) {
@@ -173,7 +173,6 @@ static void load_keymap(void) {
             wl_seat_destroy(seat);
         wl_registry_destroy(registry);
         wl_display_disconnect(display);
-        keycode_offset = 8;
     }
     if (keymap == NULL)
         keymap = xkb_keymap_new_from_names(xkb, NULL, XKB_KEYMAP_COMPILE_NO_FLAGS);
@@ -467,9 +466,13 @@ EXPORT void cjk_stop(void) {
     xkb = NULL;
 }
 
-/* Returns 0 on success, -1 without a keymap, -2 without fcitx5. */
-EXPORT int cjk_start(void) {
+/*
+ * GLFW reports evdev scancodes on Wayland and X11 keycodes on X11, even under
+ * Xwayland. Returns 0 on success, -1 without a keymap, -2 without fcitx5.
+ */
+EXPORT int cjk_start(int evdev_scancodes) {
     cjk_stop();
+    keycode_offset = evdev_scancodes ? 8 : 0;
     xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (xkb == NULL)
         return -1;

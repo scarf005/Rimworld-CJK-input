@@ -39,7 +39,7 @@ internal static class FcitxCjkInputMod {
     private static bool FieldActive => TextFocus.CapturesText && Time.frameCount - fieldFrame <= 2;
 
     [DllImport(LibraryName)]
-    private static extern int cjk_start();
+    private static extern int cjk_start(int evdevScancodes);
 
     [DllImport(LibraryName)]
     private static extern void cjk_stop();
@@ -74,7 +74,7 @@ internal static class FcitxCjkInputMod {
 
         NativeLibrary.SetDllImportResolver(typeof(FcitxCjkInputMod).Assembly,
             (name, _, _) => name == LibraryName ? NativeLibrary.Load(library) : IntPtr.Zero);
-        if (cjk_start() is var result and not 0) {
+        if (cjk_start(Glfw.GetPlatform() == GlfwPlatform.Wayland ? 1 : 0) is var result and not 0) {
             Log.Warning($"[CJK] fcitx5 input context is unavailable (code {result}); CJK input is disabled");
             return;
         }
