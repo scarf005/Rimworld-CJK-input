@@ -78,10 +78,15 @@ internal static class CjkFontFallback {
         var sizes = Traverse.Create(host).Field<List<float>>("importSizes").Value;
         foreach (var (font, size) in Traverse.Create(host).Field<List<ImFontPtr>>("fonts").Value.Zip(sizes)) {
             // Existing bakes hold loader data per source; discard them while the source count still matches.
+            // Discarding also zeroes the engine's fallback and ellipsis characters, which a merge only sets up on the
+            // atlas's last font, so missing glyphs would vanish instead of drawing as boxes.
+            var (fallbackChar, ellipsisChar) = (font.FallbackChar, font.EllipsisChar);
             font.ClearOutputData();
             foreach (var (path, fontNo, excludeRanges) in fonts) {
                 Merge(font, path, fontNo, excludeRanges, size);
             }
+
+            (font.FallbackChar, font.EllipsisChar) = (fallbackChar, ellipsisChar);
         }
 
         Traverse.Create(host).Field<int>("fontGeneration").Value++;
