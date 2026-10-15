@@ -54,7 +54,13 @@ RimWorld 1.7 使用 GLFW，不支持 Wayland 文本输入协议，fcitx5 收不�
 3. 将提交内容放入游戏文本输入队列，在文本框内绘制预编辑文字，在光标下方绘制候选列表。
 4. 游戏按固定文件名找不到 CJK 字体时，将 fontconfig 选出的 CJK 字体合并进界面字体。
 
-键盘布局只在启动时读取一次，切换布局后需重启游戏。**Debug log** 会把 fcitx5 事件写入游戏日志。
+Wayland 下键盘布局只在启动时从合成器读取一次，切换布局后需重启游戏。X11 会话下布局不取自 X 服务器，而取自 `XKB_DEFAULT_*` 环境变量，未设置时为 `us`；请在 Steam 启动选项中设置布局与选项，例如：
+
+```sh
+XKB_DEFAULT_LAYOUT=kr XKB_DEFAULT_OPTIONS=korean:ralt_hangul %command%
+```
+
+**Debug log** 会把 fcitx5 事件写入游戏日志。
 
 ## 工作原理（1.6）
 
