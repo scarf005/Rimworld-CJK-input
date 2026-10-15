@@ -22,8 +22,6 @@ internal static class FcitxCjkInputMod {
     private const int PanelWindowId = 0x434a4b;
 
     private static readonly byte[] Buffer = new byte[16384];
-    private static readonly AccessTools.FieldRef<int> CaretIndex = AccessTools.StaticFieldRefAccess<int>(AccessTools.Field(typeof(GUI), "_caretIndex"));
-    private static readonly AccessTools.FieldRef<int> SelectAnchor = AccessTools.StaticFieldRefAccess<int>(AccessTools.Field(typeof(GUI), "_selectAnchor"));
 
     private static bool contextFocused;
     private static int focusedControl;
@@ -31,7 +29,6 @@ internal static class FcitxCjkInputMod {
     private static Vector2 panelAnchor;
     private static bool swallowChars;
     private static bool discardCommits;
-    private static Preedit? preedit;
     private static Panel? panel;
 
     private static bool DebugLogging => FcitxCjkInputEntry.Settings?.DebugLog == true;
@@ -116,8 +113,8 @@ internal static class FcitxCjkInputMod {
 
     /// <summary>Commits the visible preedit before a click can move the caret or focus.</summary>
     private static void BeforeMouseButton(GlfwButtonAction action) {
-        if (action == GlfwButtonAction.Press && preedit is { } visible) {
-            QueueText(visible.Text);
+        if (action == GlfwButtonAction.Press && ImeComposition.Active) {
+            QueueText(ImeComposition.Text);
             DiscardComposition();
         }
     }
@@ -151,8 +148,7 @@ internal static class FcitxCjkInputMod {
         }
     }
 
-    private static void BeforeDrawField(Rect rect, ref string text, bool focused, out (int Caret, int Anchor)? __state) {
-        __state = null;
+    private static void BeforeDrawField(Rect rect, bool focused) {
         if (!focused) {
             return;
         }
@@ -161,22 +157,9 @@ internal static class FcitxCjkInputMod {
         panelAnchor = UI.GUIToScreenPoint(new Vector2(rect.x, rect.yMax));
         SyncFocus();
         Drain();
-        if (!contextFocused || preedit is not { } visible) {
-            return;
-        }
-
-        __state = (CaretIndex(), SelectAnchor());
-        (text, var caret) = visible.Apply(text, CaretIndex());
-        CaretIndex() = caret;
-        SelectAnchor() = caret;
     }
 
-    private static void AfterDrawField(bool focused, (int Caret, int Anchor)? __state) {
-        if (__state is var (caret, anchor)) {
-            CaretIndex() = caret;
-            SelectAnchor() = anchor;
-        }
-
+    private static void AfterDrawField(bool focused) {
         if (focused && contextFocused && panel is { IsEmpty: false } visible) {
             DrawPanel(visible);
         }
@@ -204,7 +187,7 @@ internal static class FcitxCjkInputMod {
 
     /// <summary>Resets fcitx5 and drops what it commits; the caller already inserted or abandoned the preedit.</summary>
     private static void DiscardComposition() {
-        preedit = null;
+        ImeComposition.Set("", 0);
         panel = null;
         discardCommits = true;
         cjk_reset();
@@ -225,7 +208,7 @@ internal static class FcitxCjkInputMod {
                     QueueText(commit.Text);
                     break;
                 case Preedit next:
-                    preedit = next.Text.Length > 0 ? next : null;
+                    ImeComposition.Set(next.Text, next.Cursor);
                     break;
                 case Forward { Release: false } key:
                     ForwardKey(key);
@@ -234,7 +217,7 @@ internal static class FcitxCjkInputMod {
                     panel = next;
                     break;
                 case FocusOut:
-                    preedit = null;
+                    ImeComposition.Set("", 0);
                     panel = null;
                     break;
             }

@@ -32,13 +32,7 @@ internal abstract record ImeEvent {
 
 internal sealed record Commit(string Text) : ImeEvent;
 
-internal sealed record Preedit(string Text, int Cursor) : ImeEvent {
-    /// <summary>Inserts the preedit at the caret without touching the saved field text.</summary>
-    internal (string Text, int Caret) Apply(string fieldText, int caret) {
-        var at = Math.Clamp(caret, 0, fieldText.Length);
-        return (fieldText.Insert(at, Text), at + Math.Clamp(Cursor, 0, Text.Length));
-    }
-}
+internal sealed record Preedit(string Text, int Cursor) : ImeEvent;
 
 internal sealed record Forward(int Codepoint, uint Keysym, bool Release) : ImeEvent;
 
