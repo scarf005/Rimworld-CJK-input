@@ -22,6 +22,7 @@
 
 static char commits[MAX_TEXT];
 static char preedit[MAX_TEXT];
+static uint32_t scancode_base;
 
 static void drain(void) {
     char buffer[MAX_MESSAGE + 1];
@@ -35,9 +36,10 @@ static void drain(void) {
     }
 }
 
-static int tap(uint32_t scancode) {
-    int handled = cjk_key(scancode, 1, 0, 1);
-    cjk_key(scancode, 0, 0, 1);
+/* Taps an evdev key as GLFW reports it on the platform under test. */
+static int tap(uint32_t key) {
+    int handled = cjk_key(key + scancode_base, 1, 0, 1);
+    cjk_key(key + scancode_base, 0, 0, 1);
     drain();
     return handled;
 }
@@ -45,16 +47,20 @@ static int tap(uint32_t scancode) {
 static uint32_t hangul_toggle(void) {
     uint32_t candidates[] = { KEY_HANGEUL, KEY_RIGHTALT };
     for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
-        if (xkb_state_key_get_one_sym(key_state, candidates[i] + keycode_offset) == XKB_KEY_Hangul)
+        if (xkb_state_key_get_one_sym(key_state, candidates[i] + 8) == XKB_KEY_Hangul)
             return candidates[i];
     }
     return 0;
 }
 
-int main(void) {
+/* GLFW reports evdev scancodes on Wayland and X11 keycodes (evdev + 8) on X11. */
+static void compose(int evdev_scancodes) {
     uint32_t toggle;
     int toggled = 0;
-    assert(cjk_start() == 0);
+    scancode_base = evdev_scancodes ? 0 : 8;
+    commits[0] = '\0';
+    preedit[0] = '\0';
+    assert(cjk_start(evdev_scancodes) == 0);
     toggle = hangul_toggle();
     assert(toggle != 0 && "no key emits the Hangul keysym");
     cjk_focus(1);
@@ -89,6 +95,12 @@ int main(void) {
         tap(toggle);
     cjk_focus(0);
     cjk_stop();
-    puts("PASS hangul composition through fcitx5 batch events");
+}
+
+int main(void) {
+    compose(1);
+    puts("PASS hangul composition with Wayland evdev scancodes");
+    compose(0);
+    puts("PASS hangul composition with X11 keycodes");
     return 0;
 }
