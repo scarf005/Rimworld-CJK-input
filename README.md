@@ -58,7 +58,7 @@ RimWorld 1.7은 GLFW를 쓰며 Wayland 텍스트 입력 프로토콜을 지원�
 
 1. `1.7/Assemblies/libfcitxcjkinput.so`로 fcitx5 D-Bus 입력 컨텍스트를 직접 만듭니다.
 2. 텍스트 필드에 포커스가 있을 때 GLFW 키 입력을 fcitx5에 전달하고, fcitx5가 처리한 키는 게임에 넘기지 않습니다.
-3. 커밋은 게임 텍스트 입력 큐에 넣고, 프리에디트는 필드 안에, 후보 목록은 필드 아래에 그립니다.
+3. 커밋은 게임 텍스트 입력 큐에 넣고, 프리에디트는 필드 안에, 후보 목록은 커서 아래에 그립니다.
 4. 게임이 찾는 고정 파일명의 CJK 폰트가 없으면 fontconfig가 고른 CJK 폰트를 UI 폰트에 병합합니다.
 
 키맵은 시작할 때 한 번 읽으므로 키보드 레이아웃을 바꾸면 게임을 다시 시작해야 합니다. **Debug log**는 fcitx5 이벤트를 게임 로그에 기록합니다.
@@ -133,7 +133,7 @@ RimWorld 1.7 uses GLFW, which lacks the Wayland text-input protocol, so fcitx5 n
 
 1. creates its own fcitx5 D-Bus input context through `1.7/Assemblies/libfcitxcjkinput.so`
 2. forwards GLFW key events to fcitx5 while a text field is focused and drops the keys fcitx5 consumes
-3. queues commits as game text input, draws preedit inside the field and candidates below it
+3. queues commits as game text input, draws preedit inside the field and candidates below the caret
 4. merges the CJK fonts fontconfig picks into the UI fonts when the game's fixed font paths have none
 
 The keymap is read once at startup; restart the game after changing keyboard layouts. **Debug log** writes fcitx5 events to the game log.
