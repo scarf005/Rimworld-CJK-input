@@ -29,7 +29,7 @@ internal static class FcitxCjkInputMod {
     private static bool contextFocused;
     private static int focusedControl;
     private static int fieldFrame = -10;
-    private static Vector2 panelAnchor;
+    private static Rect fieldRect;
     private static bool swallowChars;
     private static bool discardCommits;
     private static Panel? panel;
@@ -175,7 +175,7 @@ internal static class FcitxCjkInputMod {
         }
 
         fieldFrame = Time.frameCount;
-        panelAnchor = UI.GUIToScreenPoint(new Vector2(rect.x, rect.yMax));
+        fieldRect = new Rect(UI.GUIToScreenPoint(rect.position), rect.size);
         SyncFocus();
         Drain();
     }
@@ -192,7 +192,10 @@ internal static class FcitxCjkInputMod {
         Text.Font = GameFont.Small;
         var lineHeight = Text.LineHeight;
         var width = lines.Max(line => Text.CalcSize(line).x) + 16f;
-        var rect = new Rect(panelAnchor.x, panelAnchor.y + 2f, width, lineHeight * lines.Length + 8f);
+        var height = lineHeight * lines.Length + 8f;
+        var below = fieldRect.yMax + 2f;
+        var rect = new Rect(Mathf.Min(fieldRect.x, UI.screenWidth - width),
+            below + height <= UI.screenHeight ? below : fieldRect.y - 2f - height, width, height);
         Find.WindowStack.ImmediateWindow(PanelWindowId, rect, WindowLayer.Super, () => {
             Text.Font = GameFont.Small;
             for (var i = 0; i < lines.Length; i++) {
