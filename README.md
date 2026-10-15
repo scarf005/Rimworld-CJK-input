@@ -61,7 +61,13 @@ RimWorld 1.7은 GLFW를 쓰며 Wayland 텍스트 입력 프로토콜을 지원�
 3. 커밋은 게임 텍스트 입력 큐에 넣고, 프리에디트는 필드 안에, 후보 목록은 커서 아래에 그립니다.
 4. 게임이 찾는 고정 파일명의 CJK 폰트가 없으면 fontconfig가 고른 CJK 폰트를 UI 폰트에 병합합니다.
 
-키맵은 시작할 때 한 번 읽으므로 키보드 레이아웃을 바꾸면 게임을 다시 시작해야 합니다. **Debug log**는 fcitx5 이벤트를 게임 로그에 기록합니다.
+Wayland에서는 키맵을 시작할 때 컴포지터에서 한 번 읽으므로 키보드 레이아웃을 바꾸면 게임을 다시 시작해야 합니다. X11 세션에서는 X 서버가 아닌 `XKB_DEFAULT_*` 환경 변수에서 키맵을 읽고, 없으면 `us`를 씁니다. 레이아웃과 옵션을 스팀 실행 옵션으로 지정하세요. 예:
+
+```sh
+XKB_DEFAULT_LAYOUT=kr XKB_DEFAULT_OPTIONS=korean:ralt_hangul %command%
+```
+
+**Debug log**는 fcitx5 이벤트를 게임 로그에 기록합니다.
 
 ### 작동 방식 (1.6)
 
@@ -136,7 +142,13 @@ RimWorld 1.7 uses GLFW, which lacks the Wayland text-input protocol, so fcitx5 n
 3. queues commits as game text input, draws preedit inside the field and candidates below the caret
 4. merges the CJK fonts fontconfig picks into the UI fonts when the game's fixed font paths have none
 
-The keymap is read once at startup; restart the game after changing keyboard layouts. **Debug log** writes fcitx5 events to the game log.
+On Wayland the keymap is read from the compositor once at startup; restart the game after changing keyboard layouts. In an X11 session it comes from the `XKB_DEFAULT_*` environment variables, else `us`, not from the X server; set the layout and options as a Steam launch option, for example:
+
+```sh
+XKB_DEFAULT_LAYOUT=kr XKB_DEFAULT_OPTIONS=korean:ralt_hangul %command%
+```
+
+**Debug log** writes fcitx5 events to the game log.
 
 ## How it works (1.6)
 
