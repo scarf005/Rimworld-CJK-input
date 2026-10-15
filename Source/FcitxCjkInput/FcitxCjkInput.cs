@@ -66,6 +66,14 @@ internal static class FcitxCjkInputMod {
             return;
         }
 
+        // CJK text renders without fcitx5 or the native client, so the fonts are patched before either is needed.
+        var harmony = new Harmony("scarf.cjkinput");
+        try {
+            CjkFontFallback.Patch(harmony);
+        } catch (Exception exception) {
+            Log.Error($"[CJK] CJK font fallback unavailable: {exception}");
+        }
+
         var library = content.foldersToLoadDescendingOrder
             .Select(folder => Path.Combine(folder, "Assemblies", LibraryFile))
             .FirstOrDefault(File.Exists);
@@ -74,20 +82,27 @@ internal static class FcitxCjkInputMod {
             return;
         }
 
+        nint handle;
+        try {
+            handle = NativeLibrary.Load(library);
+        } catch (DllNotFoundException exception) {
+            Log.Warning($"[CJK] {exception.Message}; CJK input is disabled");
+            return;
+        }
+
         NativeLibrary.SetDllImportResolver(typeof(FcitxCjkInputMod).Assembly,
-            (name, _, _) => name == LibraryName ? NativeLibrary.Load(library) : IntPtr.Zero);
+            (name, _, _) => name == LibraryName ? handle : IntPtr.Zero);
         if (cjk_start(Glfw.GetPlatform() == GlfwPlatform.Wayland ? 1 : 0) is var result and not 0) {
             Log.Warning($"[CJK] fcitx5 input context is unavailable (code {result}); CJK input is disabled");
             return;
         }
 
-        Patch();
+        Patch(harmony);
         AppDomain.CurrentDomain.ProcessExit += (_, _) => cjk_stop();
         Log.Message("[CJK] fcitx5 input context ready");
     }
 
-    private static void Patch() {
-        var harmony = new Harmony("scarf.cjkinput");
+    private static void Patch(Harmony harmony) {
         var bridge = AccessTools.TypeByName("RimWorldWaylith.GlfwInputBridge")
             ?? throw new MissingMemberException("RimWorldWaylith.GlfwInputBridge");
         harmony.Patch(AccessTools.Method(bridge, "OnKey"), prefix: new HarmonyMethod(BeforeKey));
@@ -97,11 +112,6 @@ internal static class FcitxCjkInputMod {
         Waylith.EngineApplication.Instance.PrePollEvents += _ => ReleaseButtons();
         harmony.Patch(AccessTools.Method(typeof(GUI), "DrawTextFieldChrome"),
             prefix: new HarmonyMethod(BeforeDrawField), postfix: new HarmonyMethod(AfterDrawField));
-        try {
-            CjkFontFallback.Patch(harmony);
-        } catch (Exception exception) {
-            Log.Error($"[CJK] CJK font fallback unavailable: {exception}");
-        }
     }
 
     /// <summary>
