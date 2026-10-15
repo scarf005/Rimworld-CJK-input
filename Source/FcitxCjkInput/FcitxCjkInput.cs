@@ -30,7 +30,6 @@ internal static class FcitxCjkInputMod {
     private static bool contextFocused;
     private static int focusedControl;
     private static int fieldFrame = -10;
-    private static Rect fieldRect;
     private static bool swallowChars;
     private static bool discardCommits;
     private static Panel? panel;
@@ -185,24 +184,24 @@ internal static class FcitxCjkInputMod {
         }
     }
 
-    private static void BeforeDrawField(Rect rect, bool focused) {
+    private static void BeforeDrawField(bool focused) {
         if (!focused) {
             return;
         }
 
         fieldFrame = Time.frameCount;
-        fieldRect = new Rect(UI.GUIToScreenPoint(rect.position), rect.size);
         SyncFocus();
         Drain();
     }
 
-    private static void AfterDrawField(bool focused) {
+    private static void AfterDrawField(Rect rect, bool focused) {
         if (focused && contextFocused && panel is { IsEmpty: false } visible) {
-            DrawPanel(visible);
+            DrawPanel(visible, rect);
         }
     }
 
-    private static void DrawPanel(Panel visible) {
+    /// <summary>Opens the candidates under the caret, or above the field when they would leave the screen.</summary>
+    private static void DrawPanel(Panel visible, Rect field) {
         string[] lines = visible.Header.Length > 0 ? [visible.Header, .. visible.Candidates] : [.. visible.Candidates];
         var offset = visible.Header.Length > 0 ? 1 : 0;
         var font = Text.Font;
@@ -211,9 +210,13 @@ internal static class FcitxCjkInputMod {
         var width = lines.Max(line => Text.CalcSize(line).x) + 16f;
         Text.Font = font;
         var height = lineHeight * lines.Length + 8f;
-        var below = fieldRect.yMax + 2f;
-        var rect = new Rect(Mathf.Min(fieldRect.x, UI.screenWidth - width),
-            below + height <= UI.screenHeight ? below : fieldRect.y - 2f - height, width, height);
+        // DrawTextFieldChrome just set CandidatePos to the caret line's bottom, 3 px above a single-line
+        // field's bottom, in backend coordinates that scale distances from the field by the UI scale.
+        var origin = UI.GUIToScreenPoint(field.position);
+        var caret = origin + (ImeComposition.CandidatePos - GUIUtility.GUIToScreenPoint(field.position)) / Prefs.UIScale;
+        var below = caret.y + 5f;
+        var rect = new Rect(Mathf.Min(caret.x, UI.screenWidth - width),
+            below + height <= UI.screenHeight ? below : origin.y - 2f - height, width, height);
         Find.WindowStack.ImmediateWindow(PanelWindowId, rect, WindowLayer.Super, () => {
             Text.Font = GameFont.Small;
             for (var i = 0; i < lines.Length; i++) {
