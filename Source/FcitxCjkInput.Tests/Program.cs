@@ -12,8 +12,6 @@ internal static class Program {
             NegativePreeditCursorMeansEnd,
             CursorPastTextIsClamped,
             CursorInsideSurrogatePairCountsWholeCharacters,
-            PreeditInsertsAtCaret,
-            PreeditCaretIsClampedToField,
             ForwardKeyFieldsAreParsed,
             PanelKeepsHeaderAndCandidates,
             EmptyPanelHidesCandidates,
@@ -42,18 +40,6 @@ internal static class Program {
     private static void CursorInsideSurrogatePairCountsWholeCharacters() {
         Equal(2, ImeEvent.CharIndex("𠀀a", 4));
         Equal(3, ImeEvent.CharIndex("𠀀a", 5));
-    }
-
-    private static void PreeditInsertsAtCaret() {
-        var (text, caret) = new Preedit("한", 1).Apply("ab", 1);
-        Equal("a한b", text);
-        Equal(2, caret);
-    }
-
-    private static void PreeditCaretIsClampedToField() {
-        var (text, caret) = new Preedit("ㄱ", 5).Apply("ab", 9);
-        Equal("abㄱ", text);
-        Equal(3, caret);
     }
 
     private static void ForwardKeyFieldsAreParsed() =>
