@@ -32,7 +32,7 @@ internal static class CjkFontFallback {
         harmony.Patch(AccessTools.Method("RimWorldWaylith.Imgui.ImGuiHost:BeginFrame"), prefix: new HarmonyMethod(BeforeFrame));
     }
 
-    /// <summary>Postfix of FontFallbacks.Resolve: inserts fontconfig's CJK fonts after the script-excluding symbol fonts.</summary>
+    /// <summary>Postfix of FontFallbacks.Resolve: inserts fontconfig's CJK fonts after the script-excluding symbol and Hangul fonts.</summary>
     private static void AfterResolve(string? locale, object __result) {
         var sources = (IList)__result;
         if (HasCjk(sources)) {
@@ -40,7 +40,7 @@ internal static class CjkFontFallback {
         }
 
         var at = sources.Cast<object>().TakeWhile(source => Field(source, "ExcludeRanges") != null).Count();
-        foreach (var (path, fontNo, excludeRanges) in Enumerable.Reverse(Fonts(locale))) {
+        foreach (var (path, fontNo, excludeRanges) in Enumerable.Reverse(Fonts(locale, HasHangul(sources)))) {
             sources.Insert(at, Activator.CreateInstance(Source, path, fontNo, excludeRanges));
         }
     }
@@ -61,11 +61,12 @@ internal static class CjkFontFallback {
 
     private static void Rebuild(object host) {
         var byLocale = (IDictionary)Traverse.Create(host).Field("fallbacksByLocale").GetValue();
-        if (byLocale.Values.Cast<IList>().Any(HasCjk)) {
+        var fallbacks = byLocale.Values.Cast<IList>().ToList();
+        if (fallbacks.Any(HasCjk)) {
             return;
         }
 
-        var fonts = Fonts(null);
+        var fonts = Fonts(null, fallbacks.Any(HasHangul));
         if (fonts.Count == 0) {
             Log.Warning("[CJK] fontconfig found no CJK font; CJK text renders as boxes");
             return;
@@ -96,11 +97,18 @@ internal static class CjkFontFallback {
     private static bool HasCjk(IList sources) =>
         sources.Cast<object>().Any(source => KnownCjkFonts.Any(name => ((string)Field(source, "Path")!).Contains(name, StringComparison.OrdinalIgnoreCase)));
 
+    /// <summary>
+    /// The engine's Hangul fallbacks, such as its shipped Pretendard, exclude Han and come before ours, so another
+    /// Hangul font would draw almost nothing and still cost a copy of its file per font.
+    /// </summary>
+    private static bool HasHangul(IList sources) =>
+        sources.Cast<object>().Any(source => ReferenceEquals(Field(source, "ExcludeRanges"), HanRanges));
+
     private static object? Field(object source, string name) => Traverse.Create(source).Property(name).GetValue();
 
-    /// <summary>Mirrors FontFallbacks.Resolve: a Hangul font with Han excluded, then the locale's Han font.</summary>
-    private static List<(string Path, uint FontNo, uint[]? ExcludeRanges)> Fonts(string? locale) {
-        var hangul = FontFor("ko");
+    /// <summary>Mirrors FontFallbacks.Resolve: a Hangul font with Han excluded unless the engine has one, then the locale's Han font.</summary>
+    private static List<(string Path, uint FontNo, uint[]? ExcludeRanges)> Fonts(string? locale, bool hasHangul) {
+        var hangul = hasHangul ? null : FontFor("ko");
         var han = FontFor(locale switch { "KR" => "ko", "SC" => "zh-cn", "TC" => "zh-tw", _ => "ja" });
         return [
             .. hangul is var (hangulPath, hangulNo) ? [(hangulPath, hangulNo, HanRanges)] : Array.Empty<(string, uint, uint[]?)>(),
