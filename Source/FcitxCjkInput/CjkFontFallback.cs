@@ -17,7 +17,8 @@ namespace FcitxCjkInput;
 /// Adds the fonts fontconfig picks for CJK languages to the engine's fallback list.
 /// </summary>
 internal static class CjkFontFallback {
-    private static readonly string[] KnownCjkFonts = ["CJK", "Nanum", "DroidSansFallback", "wqy"];
+    /// <summary>The engine's Han fallbacks; its Hangul-only NanumGothic leaves Han text as boxes.</summary>
+    private static readonly string[] KnownCjkFonts = ["CJK", "DroidSansFallback", "wqy"];
     private static readonly Type Fallbacks = AccessTools.TypeByName("RimWorldWaylith.Imgui.FontFallbacks");
     private static readonly Type Source = AccessTools.Inner(Fallbacks, "Source");
     private static readonly uint[] HanRanges = (uint[])AccessTools.Field(Fallbacks, "HanRanges").GetValue(null)!;
