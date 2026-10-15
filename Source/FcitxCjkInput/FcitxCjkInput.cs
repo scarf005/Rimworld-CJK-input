@@ -212,9 +212,9 @@ internal static class FcitxCjkInputMod {
         Text.Font = font;
         var height = lineHeight * lines.Length + 8f;
         // DrawTextFieldChrome just set CandidatePos to the caret line's bottom, 3 px above a single-line
-        // field's bottom, in backend coordinates that scale distances from the field by the UI scale.
+        // field's bottom, through the backend's GUI-to-screen mapping; its inverse gives the GUI point back.
         var origin = UI.GUIToScreenPoint(field.position);
-        var caret = origin + (ImeComposition.CandidatePos - GUIUtility.GUIToScreenPoint(field.position)) / Prefs.UIScale;
+        var caret = UI.GUIToScreenPoint(GUIUtility.ScreenToGUIPoint(ImeComposition.CandidatePos));
         var below = caret.y + 5f;
         var rect = new Rect(Mathf.Min(caret.x, UI.screenWidth - width),
             below + height <= UI.screenHeight ? below : origin.y - 2f - height, width, height);
