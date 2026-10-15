@@ -195,29 +195,30 @@ internal static class FcitxCjkInputMod {
     }
 
     /// <summary>Requests the panel on repaint passes; ImmediateWindow ignores calls from the other passes.</summary>
-    private static void AfterDrawField(Rect rect, bool focused) {
+    private static void AfterDrawField(Rect rect, bool focused, bool multiline) {
         if (focused && contextFocused && Event.current.type == EventType.Repaint && panel is { IsEmpty: false } visible) {
-            DrawPanel(visible, rect);
+            DrawPanel(visible, rect, multiline);
         }
     }
 
-    /// <summary>Opens the candidates under the caret, or above the field when they would leave the screen.</summary>
-    private static void DrawPanel(Panel visible, Rect field) {
+    /// <summary>Opens the candidates under the caret, or above its line when they would leave the screen.</summary>
+    private static void DrawPanel(Panel visible, Rect field, bool multiline) {
         string[] lines = visible.Header.Length > 0 ? [visible.Header, .. visible.Candidates] : [.. visible.Candidates];
         var offset = visible.Header.Length > 0 ? 1 : 0;
+        // DrawTextFieldChrome draws the caret one line high in a text area and 3 px short of a single-line field's edges.
+        var caretHeight = multiline ? Text.LineHeight : field.height - 6f;
         var font = Text.Font;
         Text.Font = GameFont.Small;
         var lineHeight = Text.LineHeight;
         var width = lines.Max(line => Text.CalcSize(line).x) + 16f;
         Text.Font = font;
         var height = lineHeight * lines.Length + 8f;
-        // DrawTextFieldChrome just set CandidatePos to the caret line's bottom, 3 px above a single-line
-        // field's bottom, through the backend's GUI-to-screen mapping; its inverse gives the GUI point back.
-        var origin = UI.GUIToScreenPoint(field.position);
+        // DrawTextFieldChrome just set CandidatePos to the caret's bottom through the backend's GUI-to-screen
+        // mapping; its inverse gives the GUI point back.
         var caret = UI.GUIToScreenPoint(GUIUtility.ScreenToGUIPoint(ImeComposition.CandidatePos));
         var below = caret.y + 5f;
         var rect = new Rect(Mathf.Min(caret.x, UI.screenWidth - width),
-            below + height <= UI.screenHeight ? below : origin.y - 2f - height, width, height);
+            below + height <= UI.screenHeight ? below : caret.y - caretHeight - 5f - height, width, height);
         Find.WindowStack.ImmediateWindow(PanelWindowId, rect, WindowLayer.Super, () => {
             Text.Font = GameFont.Small;
             for (var i = 0; i < lines.Length; i++) {
