@@ -194,8 +194,9 @@ internal static class FcitxCjkInputMod {
         Drain();
     }
 
+    /// <summary>Requests the panel on repaint passes; ImmediateWindow ignores calls from the other passes.</summary>
     private static void AfterDrawField(Rect rect, bool focused) {
-        if (focused && contextFocused && panel is { IsEmpty: false } visible) {
+        if (focused && contextFocused && Event.current.type == EventType.Repaint && panel is { IsEmpty: false } visible) {
             DrawPanel(visible, rect);
         }
     }
