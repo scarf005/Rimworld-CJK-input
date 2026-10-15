@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using Brutal.GlfwApi;
@@ -22,6 +24,7 @@ internal static class FcitxCjkInputMod {
     private const int PanelWindowId = 0x434a4b;
 
     private static readonly byte[] Buffer = new byte[16384];
+    private static readonly List<Action> heldButtons = [];
 
     private static bool contextFocused;
     private static int focusedControl;
@@ -89,6 +92,7 @@ internal static class FcitxCjkInputMod {
         harmony.Patch(AccessTools.Method(bridge, "OnChar"), prefix: new HarmonyMethod(BeforeChar));
         harmony.Patch(AccessTools.Method(bridge, "OnMouseButton"), prefix: new HarmonyMethod(BeforeMouseButton));
         harmony.Patch(AccessTools.Method(bridge, "OnFocus"), prefix: new HarmonyMethod(BeforeWindowFocus));
+        Waylith.EngineApplication.Instance.PrePollEvents += _ => ReleaseButtons();
         harmony.Patch(AccessTools.Method(typeof(GUI), "DrawTextFieldChrome"),
             prefix: new HarmonyMethod(BeforeDrawField), postfix: new HarmonyMethod(AfterDrawField));
         try {
@@ -111,11 +115,28 @@ internal static class FcitxCjkInputMod {
     /// <summary>GLFW reports a key's character right after the key; drop it when fcitx5 consumed the key.</summary>
     private static bool BeforeChar() => !swallowChars;
 
-    /// <summary>Commits the visible preedit before a click can move the caret or focus.</summary>
-    private static void BeforeMouseButton(GlfwButtonAction action) {
+    /// <summary>
+    /// Commits the visible preedit before a click can move the caret or focus. The game dispatches a
+    /// frame's clicks before its typed text, so the click and later button events wait for the next frame.
+    /// </summary>
+    private static bool BeforeMouseButton(MethodBase __originalMethod, object __instance, object[] __args, GlfwButtonAction action) {
         if (action == GlfwButtonAction.Press && ImeComposition.Active) {
             QueueText(ImeComposition.Text);
             DiscardComposition();
+        } else if (heldButtons.Count == 0) {
+            return true;
+        }
+
+        heldButtons.Add(() => __originalMethod.Invoke(__instance, __args));
+        return false;
+    }
+
+    /// <summary>Replays held button events after the next frame resets its input state.</summary>
+    private static void ReleaseButtons() {
+        Action[] held = [.. heldButtons];
+        heldButtons.Clear();
+        foreach (var replay in held) {
+            replay();
         }
     }
 

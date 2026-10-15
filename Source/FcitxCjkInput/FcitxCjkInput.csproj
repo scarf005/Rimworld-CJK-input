@@ -19,6 +19,7 @@
   <ItemGroup>
     <Reference Include="$(RIMWORLD_DIR)/Assembly-CSharp.dll" Private="false" />
     <Reference Include="$(RIMWORLD_DIR)/UnityStubs.dll" Private="false" />
+    <Reference Include="$(RIMWORLD_DIR)/Waylith.dll" Private="false" />
     <Reference Include="$(RIMWORLD_DIR)/Brutal.Glfw.dll" Private="false" />
     <Reference Include="$(RIMWORLD_DIR)/Brutal.ImGui.dll" Private="false" />
     <Reference Include="$(RIMWORLD_DIR)/Brutal.Core.Common.dll" Private="false" />
