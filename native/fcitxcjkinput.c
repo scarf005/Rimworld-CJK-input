@@ -48,11 +48,7 @@
 /* fcitx-utils/capabilityflags.h */
 #define CAPABILITY_PREEDIT (1ULL << 1)
 #define CAPABILITY_FORMATTED_PREEDIT (1ULL << 4)
-#define CAPABILITY_KEY_EVENT_ORDER_FIX (1ULL << 37)
 #define CAPABILITY_CLIENT_SIDE_INPUT_PANEL (1ULL << 39)
-
-/* dbusfrontend.cpp batched event kinds */
-enum { BATCHED_COMMIT_STRING, BATCHED_PREEDIT, BATCHED_FORWARD_KEY };
 
 static DBusConnection *bus;
 static char context_path[256];
@@ -295,46 +291,6 @@ static void enqueue_panel(DBusMessage *signal) {
     enqueue(message);
 }
 
-/* Reads the a(uv) events returned by ProcessKeyEventBatch. */
-static void enqueue_batch(DBusMessageIter *array) {
-    DBusMessageIter item;
-    dbus_message_iter_recurse(array, &item);
-    while (dbus_message_iter_get_arg_type(&item) == DBUS_TYPE_STRUCT) {
-        DBusMessageIter field;
-        DBusMessageIter variant;
-        uint32_t kind = 0;
-        dbus_message_iter_recurse(&item, &field);
-        dbus_message_iter_get_basic(&field, &kind);
-        dbus_message_iter_next(&field);
-        dbus_message_iter_recurse(&field, &variant);
-        if (kind == BATCHED_COMMIT_STRING &&
-            dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
-            const char *text = "";
-            dbus_message_iter_get_basic(&variant, &text);
-            enqueue_commit(text);
-        } else if (kind == BATCHED_PREEDIT &&
-            dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRUCT) {
-            DBusMessageIter preedit;
-            dbus_message_iter_recurse(&variant, &preedit);
-            enqueue_preedit(&preedit);
-        } else if (kind == BATCHED_FORWARD_KEY &&
-            dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRUCT) {
-            DBusMessageIter key;
-            uint32_t keysym = 0;
-            uint32_t state = 0;
-            dbus_bool_t release = FALSE;
-            dbus_message_iter_recurse(&variant, &key);
-            dbus_message_iter_get_basic(&key, &keysym);
-            dbus_message_iter_next(&key);
-            dbus_message_iter_get_basic(&key, &state);
-            dbus_message_iter_next(&key);
-            dbus_message_iter_get_basic(&key, &release);
-            enqueue_forward(keysym, release);
-        }
-        dbus_message_iter_next(&item);
-    }
-}
-
 static void handle_signal(DBusMessage *signal) {
     DBusMessageIter iter;
     if (strcmp(dbus_message_get_path(signal) ?: "", context_path) != 0)
@@ -412,8 +368,8 @@ static int create_context(void) {
     DBusMessage *reply;
     const char *arguments[][2] = { { "program", "RimWorld" }, { "display", "wayland:" } };
     const char *path = NULL;
-    dbus_uint64_t capability = CAPABILITY_PREEDIT | CAPABILITY_FORMATTED_PREEDIT |
-        CAPABILITY_KEY_EVENT_ORDER_FIX | CAPABILITY_CLIENT_SIDE_INPUT_PANEL;
+    dbus_uint64_t capability =
+        CAPABILITY_PREEDIT | CAPABILITY_FORMATTED_PREEDIT | CAPABILITY_CLIENT_SIDE_INPUT_PANEL;
     char rule[512];
 
     dbus_message_iter_init_append(message, &iter);
@@ -508,11 +464,12 @@ EXPORT void cjk_reset_keys(void) {
 
 /*
  * action: 0 release, 1 press, 2 repeat. Every key updates the modifier state;
- * only forwarded keys reach fcitx5. Returns 1 when fcitx5 consumed the key.
+ * only forwarded keys reach fcitx5. Returns 1 when fcitx5 consumed the key,
+ * with the events it caused already queued. Uses ProcessKeyEvent since
+ * ProcessKeyEventBatch needs fcitx5 5.0.15+ (Ubuntu 22.04 ships 5.0.14).
  */
 EXPORT int cjk_key(uint32_t scancode, int action, uint32_t time, int forward) {
     DBusMessage *reply;
-    DBusMessageIter iter;
     dbus_bool_t handled = FALSE;
     dbus_bool_t release = action == 0;
     uint32_t keycode = scancode + keycode_offset;
@@ -527,19 +484,14 @@ EXPORT int cjk_key(uint32_t scancode, int action, uint32_t time, int forward) {
     if (!forward || keysym == XKB_KEY_NoSymbol)
         return 0;
 
-    reply = call("ProcessKeyEventBatch", DBUS_TYPE_UINT32, &keysym, DBUS_TYPE_UINT32, &keycode,
+    reply = call("ProcessKeyEvent", DBUS_TYPE_UINT32, &keysym, DBUS_TYPE_UINT32, &keycode,
         DBUS_TYPE_UINT32, &state, DBUS_TYPE_BOOLEAN, &release, DBUS_TYPE_UINT32, &time,
         DBUS_TYPE_INVALID);
     pump();
     if (reply == NULL)
         return 0;
-    if (dbus_message_iter_init(reply, &iter) &&
-        dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_ARRAY) {
-        enqueue_batch(&iter);
-        dbus_message_iter_next(&iter);
-        if (dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_BOOLEAN)
-            dbus_message_iter_get_basic(&iter, &handled);
-    }
+    if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &handled, DBUS_TYPE_INVALID))
+        handled = FALSE;
     dbus_message_unref(reply);
     return handled ? 1 : 0;
 }
