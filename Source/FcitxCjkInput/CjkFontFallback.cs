@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Brutal.ImGuiApi;
 using Brutal.Pointers;
@@ -22,6 +23,7 @@ internal static class CjkFontFallback {
     private static readonly Type Fallbacks = AccessTools.TypeByName("RimWorldWaylith.Imgui.FontFallbacks");
     private static readonly Type Source = AccessTools.Inner(Fallbacks, "Source");
     private static readonly uint[] HanRanges = (uint[])AccessTools.Field(Fallbacks, "HanRanges").GetValue(null)!;
+    private static readonly MethodInfo FallbackFileData = AccessTools.Method("RimWorldWaylith.Imgui.ImGuiHost:FallbackFileData");
 
     private static bool applied;
 
@@ -117,10 +119,15 @@ internal static class CjkFontFallback {
         }
     }
 
-    /// <summary>Mirrors ImGuiHost.AddFallbacks, targeting an already loaded font.</summary>
+    /// <summary>Mirrors ImGuiHost.AddFallbacks, targeting an already loaded font with the engine's shared file data.</summary>
     private static unsafe void Merge(ImFontPtr font, string path, uint fontNo, uint[]? excludeRanges, float size) {
+        var (data, length) = ((nint, int))FallbackFileData.Invoke(null, [path])!;
+        if (data == 0) {
+            return;
+        }
+
         var config = new ImFontConfig {
-            FontDataOwnedByAtlas = true,
+            FontDataOwnedByAtlas = false,
             GlyphMaxAdvanceX = float.MaxValue,
             RasterizerMultiply = 1f,
             RasterizerDensity = 1f,
@@ -134,6 +141,6 @@ internal static class CjkFontFallback {
             config.GlyphExcludeRanges = new Ptr<uint>((uint*)Marshal.UnsafeAddrOfPinnedArrayElement(excludeRanges, 0));
         }
 
-        ImGui.GetIO().Fonts.AddFontFromFileTTF(path, size, new ImFontConfigPtr(&config));
+        ImGui.GetIO().Fonts.AddFontFromMemoryTTF((void*)data, length, size, new ImFontConfigPtr(&config));
     }
 }
