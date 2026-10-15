@@ -32,7 +32,7 @@ ldconfig -p | grep libdbus-1.so.3
 ```
 
 
-RimWorld 1.7 베타는 `libxkbcommon`, `libwayland-client`(Wayland 세션), `fc-match`(fontconfig)도 사용합니다. 대부분의 데스크톱 배포판에는 기본 설치되어 있습니다.
+RimWorld 1.7 베타는 `libxkbcommon`, `libwayland-client`, `fc-match`(fontconfig)도 사용합니다. 대부분의 데스크톱 배포판에는 기본 설치되어 있습니다.
 
 ### 2. (1.6만 해당) 스팀 Rimworld 우클릭 > `속성` 좌클릭
 
@@ -119,7 +119,7 @@ Linux fcitx5 input support for RimWorld 1.6 and 1.7 beta text fields.
 - [Harmony](https://steamcommunity.com/sharedfiles/filedetails/?id=2009463077)
 - fcitx5
 - `libdbus-1.so.3`
-- 1.7: `libxkbcommon`, `libwayland-client` (Wayland sessions), `fc-match` (fontconfig)
+- 1.7: `libxkbcommon`, `libwayland-client`, `fc-match` (fontconfig)
 
 RimWorld 1.6 only: set this Steam launch option before starting RimWorld:
 ![](./assets/settings.webp)

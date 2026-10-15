@@ -29,7 +29,7 @@ ldconfig -p | grep libdbus-1.so.3
         libdbus-1.so.3 (libc6) => /lib/libdbus-1.so.3
 ```
 
-RimWorld 1.7 测试版还会用到 `libxkbcommon`、`libwayland-client`（Wayland 会话）与 `fc-match`（fontconfig），大多数桌面发行版已默认安装。
+RimWorld 1.7 测试版还会用到 `libxkbcommon`、`libwayland-client` 与 `fc-match`（fontconfig），大多数桌面发行版已默认安装。
 
 ### 2.（仅 1.6）Steam 中右键 RimWorld > 点击 `属性`
 
