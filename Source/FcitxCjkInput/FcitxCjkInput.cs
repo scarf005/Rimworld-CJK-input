@@ -27,12 +27,14 @@ internal static class FcitxCjkInputMod {
     private static readonly List<Action> heldButtons = [];
     private static readonly HashSet<int> consumedPresses = [];
 
-    private static bool contextFocused;
     private static int focusedControl;
     private static int fieldFrame = -10;
     private static bool swallowChars;
     private static bool discardCommits;
     private static Panel? panel;
+
+    /// <summary>The input context has focus exactly while a text field is tracked.</summary>
+    private static bool ContextFocused => focusedControl != 0;
 
     private static bool DebugLogging => FcitxCjkInputEntry.Settings?.DebugLog == true;
 
@@ -108,8 +110,7 @@ internal static class FcitxCjkInputMod {
     /// </summary>
     private static bool BeforeKey(int scancode, ref GlfwKeyAction action) {
         SyncFocus();
-        var forward = contextFocused && FieldActive;
-        var handled = cjk_key((uint)scancode, (int)action, (uint)Environment.TickCount, forward ? 1 : 0) == 1;
+        var handled = cjk_key((uint)scancode, (int)action, (uint)Environment.TickCount, ContextFocused ? 1 : 0) == 1;
         Drain();
         swallowChars = handled && action != GlfwKeyAction.Release;
         if (swallowChars) {
@@ -168,18 +169,17 @@ internal static class FcitxCjkInputMod {
     private static void SyncFocus() {
         var control = FieldActive ? GUIUtility.keyboardControl : 0;
         if (control != focusedControl) {
-            if (focusedControl != 0) {
+            if (ContextFocused) {
                 DiscardComposition();
             }
 
-            focusedControl = control;
-            if (contextFocused != (control != 0)) {
-                contextFocused = control != 0;
-                cjk_focus(contextFocused ? 1 : 0);
+            if (ContextFocused != (control != 0)) {
+                cjk_focus(control != 0 ? 1 : 0);
             }
 
+            focusedControl = control;
             if (DebugLogging) {
-                Log.Message($"[CJK] text field control {control}, input context focused: {contextFocused}");
+                Log.Message($"[CJK] text field control {control}, input context focused: {ContextFocused}");
             }
         }
     }
@@ -196,7 +196,7 @@ internal static class FcitxCjkInputMod {
 
     /// <summary>Requests the panel on repaint passes; ImmediateWindow ignores calls from the other passes.</summary>
     private static void AfterDrawField(Rect rect, bool focused, bool multiline) {
-        if (focused && contextFocused && Event.current.type == EventType.Repaint && panel is { IsEmpty: false } visible) {
+        if (focused && ContextFocused && Event.current.type == EventType.Repaint && panel is { IsEmpty: false } visible) {
             DrawPanel(visible, rect, multiline);
         }
     }
@@ -251,7 +251,7 @@ internal static class FcitxCjkInputMod {
             }
 
             switch (ImeEvent.Parse(line)) {
-                case Commit commit when contextFocused && !discardCommits:
+                case Commit commit when ContextFocused && !discardCommits:
                     QueueText(commit.Text);
                     break;
                 case Preedit next:
