@@ -36,11 +36,14 @@ static void drain(void) {
     }
 }
 
-/* Taps an evdev key as GLFW reports it on the platform under test. */
+/*
+ * Taps an evdev key as GLFW reports it on the platform under test. The game
+ * drains right after each key, so the press's events must already be queued.
+ */
 static int tap(uint32_t key) {
     int handled = cjk_key(key + scancode_base, 1, 0, 1);
-    cjk_key(key + scancode_base, 0, 0, 1);
     drain();
+    cjk_key(key + scancode_base, 0, 0, 1);
     return handled;
 }
 
