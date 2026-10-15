@@ -122,7 +122,7 @@ Linux fcitx5 input support for RimWorld 1.6 and 1.7 beta text fields.
 - 1.7: `libxkbcommon`, `libwayland-client` (Wayland sessions), `fc-match` (fontconfig)
 
 RimWorld 1.6 only: set this Steam launch option before starting RimWorld:
-![](image.png)
+![](./assets/settings.webp)
 ```text
 XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
 ```
