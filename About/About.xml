@@ -2,7 +2,7 @@
 <ModMetaData>
   <name>리눅스 Fcitx 한글 입력 / Fcitx CJK Input</name>
   <author>scarf</author>
-  <modVersion>0.0.3</modVersion>
+  <modVersion>0.0.4</modVersion>
   <packageId>scarf.cjkinput</packageId>
   <supportedVersions>
     <li>1.6</li>
@@ -26,8 +26,11 @@
 1. 바이브 코딩으로 만들어진 프로그램이므로 사용에 유의하십시오.
 2. 불완전하게 지원하기 때문에 잔버그가 있습니다. 보통 한영키 변경 시 해결 가능합니다.
 
-Steam 시작 옵션 (1.6만 해당, 1.7은 필요 없음):
-XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+Steam 시작 옵션:
+- 1.6: XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+- 1.7 X11 세션: 키맵을 X 서버가 아닌 XKB_DEFAULT_* 환경 변수에서 읽고, 없으면 us를 씁니다. 예:
+  XKB_DEFAULT_LAYOUT=kr XKB_DEFAULT_OPTIONS=korean:ralt_hangul %command%
+- 1.7 Wayland 세션: 필요 없음. 키보드 레이아웃을 바꾸면 게임을 다시 시작하십시오.
 
 요구 사항:
 - 네이티브 Linux RimWorld 1.6 또는 1.7 베타
@@ -45,8 +48,11 @@ On 1.7, routes text-field keys through its own fcitx5 input context and draws pr
 
 WARNING: ENTIRELY VIBE CODED, USE AT YOUR OWN RISK
 
-Steam launch options (1.6 only, not needed on 1.7):
-XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+Steam launch options:
+- 1.6: XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+- 1.7 X11 session: the keymap comes from the XKB_DEFAULT_* environment variables, else us, not from the X server. For example:
+  XKB_DEFAULT_LAYOUT=kr XKB_DEFAULT_OPTIONS=korean:ralt_hangul %command%
+- 1.7 Wayland session: none. Restart the game after changing keyboard layouts.
 
 Requirements:
 - Native Linux RimWorld 1.6 or 1.7 beta
@@ -59,8 +65,11 @@ RimWorld Linux 版的 fcitx5 中文（及韩文）输入支持。
 
 注意事项：这是一个通过 vibe coding 编写的程序，使用时请自行承担风险。输入支持尚不完整，存在一些小问题，通常切换中英文后即可解决。
 
-Steam 启动选项（仅 1.6，1.7 无需设置）：
-XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+Steam 启动选项：
+- 1.6：XMODIFIERS=@im=fcitx SDL_IM_MODULE=fcitx %command%
+- 1.7 X11 会话：键盘布局不取自 X 服务器，而取自 XKB_DEFAULT_* 环境变量，未设置时为 us。例如：
+  XKB_DEFAULT_LAYOUT=kr XKB_DEFAULT_OPTIONS=korean:ralt_hangul %command%
+- 1.7 Wayland 会话：无需设置。切换键盘布局后需重启游戏。
 
 要求：
 - 原生 Linux RimWorld 1.6 或 1.7 测试版
